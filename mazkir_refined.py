@@ -1,6 +1,7 @@
 import json
 import os
 import litellm
+import litellm.exceptions # For specific LiteLLM exceptions
 import logging
 from datetime import datetime
 
@@ -178,26 +179,43 @@ Current tasks (first 3 for context only, do not modify directly):
 {json.dumps(memory_data.get('tasks', [])[:3], indent=2)} 
 
 Respond with ONLY the JSON action or a natural language message."""
-    logger.debug(f"Prompt for LLM:\n{prompt}")
+    logger.debug(f"Prompt for LLM (model: {MAZKIR_LLM_MODEL}):\n{prompt}")
 
     try:
         # Check for common API keys for litellm
-        api_key_present = any(os.getenv(key) for key in ["OPENAI_API_KEY", "ANTHROPIC_API_KEY", "COHERE_API_KEY", "REPLICATE_API_TOKEN"]) # Add more as needed
-        if not api_key_present:
-             logger.warning("No common LLM API key (e.g., OPENAI_API_KEY, ANTHROPIC_API_KEY) found in environment. LiteLLM call may fail or use a fallback/mock.")
+        # This check is more for user guidance; LiteLLM handles actual key management.
+        api_key_present = any(os.getenv(key) for key in [
+            "OPENAI_API_KEY", "ANTHROPIC_API_KEY", "COHERE_API_KEY", 
+            "REPLICATE_API_TOKEN", "GEMINI_API_KEY" # Added Gemini as an example
+        ])
+        if not api_key_present and not litellm.mock_response: # Don't warn if mock is intentionally set
+             logger.warning(
+                "No common LLM API key (e.g., OPENAI_API_KEY, ANTHROPIC_API_KEY, GEMINI_API_KEY) "
+                "found in environment. LiteLLM call may fail or use a fallback/mock if not configured globally."
+            )
         
+        logger.info(f"Sending request to LiteLLM with model: {MAZKIR_LLM_MODEL}")
         response = litellm.completion(
-            model=MAZKIR_LLM_MODEL,
+            model=MAZKIR_LLM_MODEL, # MAZKIR_LLM_MODEL is read from env at module level
             messages=[{"content": prompt, "role": "user"}]
+            # Add other parameters like temperature, max_tokens if needed
+            # e.g., temperature=0.7, max_tokens=150
         )
         llm_output = response.choices[0].message.content.strip()
-        logger.debug(f"Raw LLM Output: {llm_output}")
+        logger.debug(f"Raw LLM Output from {MAZKIR_LLM_MODEL}: {llm_output}")
+
     except litellm.exceptions.APIError as e:
-        logger.error(f"LiteLLM APIError: {e}", exc_info=True)
-        return f"Error: LLM API interaction failed: {e}"
-    except Exception as e:
-        logger.error(f"Unexpected error calling LiteLLM: {e}", exc_info=True)
-        return f"Error: Could not get response from LLM: {e}"
+        logger.error(f"LiteLLM APIError (model: {MAZKIR_LLM_MODEL}): {e}", exc_info=True)
+        return f"Error: The AI model API returned an error: {e}"
+    except litellm.exceptions.TimeoutError as e:
+        logger.error(f"LiteLLM TimeoutError (model: {MAZKIR_LLM_MODEL}): {e}", exc_info=True)
+        return "Error: The request to the AI model timed out. Please try again later."
+    except litellm.exceptions.ServiceUnavailableError as e:
+        logger.error(f"LiteLLM ServiceUnavailableError (model: {MAZKIR_LLM_MODEL}): {e}", exc_info=True)
+        return "Error: The AI model service is currently unavailable. Please try again later."
+    except Exception as e: # Catch any other exception from LiteLLM or other issues
+        logger.error(f"Unexpected error calling LiteLLM (model: {MAZKIR_LLM_MODEL}): {e}", exc_info=True)
+        return f"Error: Could not get response from LLM due to an unexpected issue: {e}"
 
     try:
         action_dict = json.loads(llm_output)

@@ -4,9 +4,11 @@ import json
 import os
 import tempfile
 from datetime import datetime
+import logging # Added for logger access
 
 # Adjust import path if mazkir_refined is in a different directory
 import mazkir_refined
+import litellm.exceptions # For mocking specific LiteLLM errors
 
 # Suppress logging during tests to keep output clean
 # You might want to enable it for debugging specific tests
@@ -207,26 +209,70 @@ class TestMazkirRefined(unittest.TestCase):
         memory_data = self.mock_memory_base.copy()
         user_message = "Trigger API error"
         
-        # Simulate litellm.completion raising an APIError
-        # Note: litellm.exceptions.APIError needs to be available or use a generic Exception for testing
-        # For this example, let's assume litellm.exceptions.APIError exists and can be imported
-        # If not, you might need to mock litellm.exceptions itself or use a more generic error
-        try:
-            from litellm.exceptions import APIError as LiteLLMAPIError
-        except ImportError:
-            # If litellm is not fully installed or this specific exception path is different,
-            # we use a generic Exception and check for its message.
-            # This makes the test less specific but more resilient to litellm's internal structure.
-            LiteLLMAPIError = Exception # Fallback to generic Exception
-            print("\nWarning: litellm.exceptions.APIError not found, using generic Exception for LLM API error test.")
-
-        mock_litellm_completion.side_effect = LiteLLMAPIError("Simulated API Error")
-        
+        mock_litellm_completion.side_effect = litellm.exceptions.APIError("Simulated API Error from LiteLLM")
         result = mazkir_refined.process_user_input(user_message, memory_data)
-        
-        self.assertIn("Error: LLM API interaction failed", result)
-        self.assertIn("Simulated API Error", result)
+        self.assertIn("Error: The AI model API returned an error: Simulated API Error from LiteLLM", result)
         mock_perform_action.assert_not_called()
+
+    @patch('mazkir_refined.litellm.completion')
+    @patch('mazkir_refined.perform_file_action')
+    def test_process_input_llm_timeout_error(self, mock_perform_action, mock_litellm_completion):
+        memory_data = self.mock_memory_base.copy()
+        user_message = "Trigger Timeout error"
+        
+        mock_litellm_completion.side_effect = litellm.exceptions.TimeoutError("Simulated Timeout from LiteLLM")
+        result = mazkir_refined.process_user_input(user_message, memory_data)
+        self.assertIn("Error: The request to the AI model timed out. Please try again later.", result)
+        mock_perform_action.assert_not_called()
+
+    @patch('mazkir_refined.litellm.completion')
+    @patch('mazkir_refined.perform_file_action')
+    def test_process_input_llm_service_unavailable_error(self, mock_perform_action, mock_litellm_completion):
+        memory_data = self.mock_memory_base.copy()
+        user_message = "Trigger Service Unavailable error"
+        
+        mock_litellm_completion.side_effect = litellm.exceptions.ServiceUnavailableError("Simulated Service Unavailable from LiteLLM")
+        result = mazkir_refined.process_user_input(user_message, memory_data)
+        self.assertIn("Error: The AI model service is currently unavailable. Please try again later.", result)
+        mock_perform_action.assert_not_called()
+
+    @patch('mazkir_refined.litellm.completion')
+    @patch('mazkir_refined.perform_file_action')
+    def test_process_input_llm_generic_exception(self, mock_perform_action, mock_litellm_completion):
+        memory_data = self.mock_memory_base.copy()
+        user_message = "Trigger generic error"
+        
+        mock_litellm_completion.side_effect = Exception("Some generic unexpected error")
+        result = mazkir_refined.process_user_input(user_message, memory_data)
+        self.assertIn("Error: Could not get response from LLM due to an unexpected issue: Some generic unexpected error", result)
+        mock_perform_action.assert_not_called()
+        
+    @patch.dict(os.environ, {"MAZKIR_LLM_MODEL": "test-model-from-env"})
+    @patch('mazkir_refined.litellm.completion') 
+    @patch('mazkir_refined.perform_file_action')
+    def test_process_input_uses_configured_llm_model(self, mock_perform_action, mock_litellm_completion):
+        # This reloads mazkir_refined to pick up the patched environment variable at module load time for MAZKIR_LLM_MODEL
+        # This is a bit advanced; simpler alternative is to patch mazkir_refined.MAZKIR_LLM_MODEL directly.
+        import importlib
+        importlib.reload(mazkir_refined) # Reload to ensure MAZKIR_LLM_MODEL is read from patched env
+        
+        memory_data = self.mock_memory_base.copy()
+        user_message = "Hello"
+        llm_response_content = "Hi there from test-model-from-env!"
+        
+        mock_llm_response = MagicMock()
+        mock_llm_response.choices[0].message.content = llm_response_content
+        mock_litellm_completion.return_value = mock_llm_response
+        
+        mazkir_refined.process_user_input(user_message, memory_data)
+        
+        mock_litellm_completion.assert_called_once()
+        args, kwargs = mock_litellm_completion.call_args
+        self.assertEqual(kwargs.get('model'), "test-model-from-env")
+
+        # Clean up: Restore original MAZKIR_LLM_MODEL or remove the env var if it wasn't there
+        del os.environ['MAZKIR_LLM_MODEL']
+        importlib.reload(mazkir_refined) # Reload again to restore original state
 
     # --- Tests for load_memory and save_memory (File I/O) ---
     def test_save_and_load_memory_integration(self):
@@ -308,21 +354,12 @@ if __name__ == '__main__':
     # e.g., by setting PYTHONPATH or modifying sys.path
     # For simplicity, this assumes mazkir_refined.py is in the same directory or PYTHONPATH
     
-    # If litellm is not installed, some tests might behave differently or fail
-    # The mock for litellm.exceptions.APIError tries to handle this gracefully.
-    try:
-        import litellm
-    except ImportError:
-        print("Warning: litellm library not found. LLM-related tests might be affected or use generic fallbacks.")
-        # Mock litellm globally if it's not found, so imports don't break
-        # This is a bit heavy-handed but can help tests run for non-LLM parts.
-        # litellm = MagicMock()
-        # litellm.exceptions = MagicMock()
-        # litellm.exceptions.APIError = type('APIError', (Exception,), {})
-
+    # If litellm is not installed, some tests might behave differently or fail.
+    # The tests for specific litellm exceptions would fail if litellm.exceptions module isn't available.
+    # For this exercise, we assume litellm is available in the test environment.
 
     # Setup logging for tests - can be useful for debugging
-    # logging.basicConfig(level=logging.DEBUG) # Or INFO
+    # logging.basicConfig(stream=sys.stderr, level=logging.DEBUG) # Or INFO
     # mazkir_refined.logger.setLevel(logging.DEBUG) # Set level for the module's logger
     
     unittest.main()
