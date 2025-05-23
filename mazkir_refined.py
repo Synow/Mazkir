@@ -7,7 +7,7 @@ from datetime import datetime
 # --- Configuration ---
 # Setup basic logging
 logging.basicConfig(
-    level=logging.DEBUG,
+    level=logging.INFO,
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
     handlers=[
         logging.StreamHandler() # Outputs to console
@@ -18,7 +18,11 @@ logger = logging.getLogger(__name__)
 
 # Environment variable configuration
 MAZKIR_MEMORY_FILE = os.getenv("MAZKIR_MEMORY_FILE", "mazkir_memory.json")
-MAZKIR_LLM_MODEL = os.getenv("MAZKIR_LLM_MODEL", "gpt-3.5-turbo")
+os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = "/Users/sivan/.config/gcloud/service-account-key.json"
+MAZKIR_LLM_MODEL = os.getenv("MAZKIR_LLM_MODEL", "vertex_ai/gemini-2.5-flash-preview-04-17")
+os.environ["LITELLM_LOG"] = "INFO"
+
+
 
 # --- Custom Exceptions ---
 class MemoryOperationError(Exception):
@@ -161,7 +165,6 @@ def perform_file_action(action_dict, memory_data):
 # --- LLM Interaction ---
 def process_user_input(user_input, memory_data):
     """Processes user input using LLM and available tools."""
-    logger.debug(f"Processing user input: '{user_input}'")
 
     prompt = f"""User input: "{user_input}"
 Available tools:
@@ -178,30 +181,18 @@ Current tasks (first 3 for context only, do not modify directly):
 {json.dumps(memory_data.get('tasks', [])[:3], indent=2)} 
 
 Respond with ONLY the JSON action or a natural language message."""
-    logger.debug(f"Prompt for LLM:\n{prompt}")
 
     try:
-        # Check for common API keys for litellm
-        api_key_present = any(os.getenv(key) for key in ["OPENAI_API_KEY", "ANTHROPIC_API_KEY", "COHERE_API_KEY", "REPLICATE_API_TOKEN"]) # Add more as needed
-        if not api_key_present:
-             logger.warning("No common LLM API key (e.g., OPENAI_API_KEY, ANTHROPIC_API_KEY) found in environment. LiteLLM call may fail or use a fallback/mock.")
-        
         response = litellm.completion(
             model=MAZKIR_LLM_MODEL,
             messages=[{"content": prompt, "role": "user"}]
         )
         llm_output = response.choices[0].message.content.strip()
-        logger.debug(f"Raw LLM Output: {llm_output}")
-    except litellm.exceptions.APIError as e:
-        logger.error(f"LiteLLM APIError: {e}", exc_info=True)
-        return f"Error: LLM API interaction failed: {e}"
     except Exception as e:
         logger.error(f"Unexpected error calling LiteLLM: {e}", exc_info=True)
         return f"Error: Could not get response from LLM: {e}"
-
     try:
         action_dict = json.loads(llm_output)
-        logger.debug(f"LLM output parsed as JSON: {action_dict}")
         if "action" in action_dict:
             tool_result = perform_file_action(action_dict, memory_data)
             return f"Action result: {json.dumps(tool_result)}"
@@ -289,48 +280,5 @@ def run_interactive_mode():
 if __name__ == "__main__":
     # --- Setup Phase ---
     logger.info("Mazkir script initiated by user.")
-    
-    # LiteLLM specific: API keys are typically set as environment variables.
-    # The script will warn if common keys are not found.
-    
-    # Mocking LiteLLM for environments without API keys (for basic testing)
-    if not any(os.getenv(key) for key in ["OPENAI_API_KEY", "ANTHROPIC_API_KEY", "COHERE_API_KEY", "REPLICATE_API_TOKEN"]):
-        logger.warning("No common LLM API keys detected. Using MOCK LiteLLM completion for this session.")
-        
-        # --- Mock LiteLLM Completion Function ---
-        def mock_litellm_completion(*args, **kwargs):
-            # pylint: disable=unused-argument
-            logger.debug(f"Mock LLM called with messages: {kwargs.get('messages')}")
-            
-            class MockMessage:
-                def __init__(self, content=""):
-                    self.content = content
-            
-            class MockChoice:
-                def __init__(self, content=""):
-                    self.message = MockMessage(content)
-            
-            class MockResponse:
-                def __init__(self, content=""):
-                    self.choices = [MockChoice(content)]
-
-            user_msg_content = kwargs.get("messages", [{}])[0].get("content", "").lower()
-            
-            if "add test task" in user_msg_content:
-                logger.debug("Mock LLM: Simulating 'add_task' action.")
-                return MockResponse('{"action": "add_task", "params": {"description": "Test task from mock"}}')
-            elif "show tasks" in user_msg_content or "get tasks" in user_msg_content:
-                logger.debug("Mock LLM: Simulating 'get_tasks' action.")
-                return MockResponse('{"action": "get_tasks"}')
-            elif "update task" in user_msg_content: # Basic mock for update
-                logger.debug("Mock LLM: Simulating 'update_task_status' action for task_id 1.")
-                return MockResponse('{"action": "update_task_status", "params": {"task_id": 1, "status": "completed from mock"}}')
-            else:
-                logger.debug("Mock LLM: Providing default assistance message.")
-                return MockResponse("This is a mock LLM response as no API key was detected. Please ask to 'add test task', 'show tasks', or 'update task'.")
-        
-        litellm.completion = mock_litellm_completion
-        # litellm.set_verbose = True # Useful for debugging litellm itself
-
     # --- Run Interactive Mode ---
     run_interactive_mode()
