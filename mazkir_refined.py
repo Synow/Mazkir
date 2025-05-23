@@ -21,6 +21,65 @@ logger = logging.getLogger(__name__)
 MAZKIR_MEMORY_FILE = os.getenv("MAZKIR_MEMORY_FILE", "mazkir_memory.json")
 MAZKIR_LLM_MODEL = os.getenv("MAZKIR_LLM_MODEL", "gpt-3.5-turbo")
 
+# --- Tool Schemas for LiteLLM ---
+MAZKIR_TOOLS_SCHEMAS = [
+    {
+        "type": "function",
+        "function": {
+            "name": "get_tasks",
+            "description": "Get all current tasks from the user's task list.",
+            "parameters": {
+                "type": "object",
+                "properties": {},
+                "required": []
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "add_task",
+            "description": "Add a new task to the user's task list.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "description": {
+                        "type": "string",
+                        "description": "The description of the task."
+                    },
+                    "due_date": {
+                        "type": "string",
+                        "description": "The due date for the task in YYYY-MM-DD format. Optional."
+                    }
+                },
+                "required": ["description"]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "update_task_status",
+            "description": "Update the status of an existing task.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "task_id": {
+                        "type": "integer",
+                        "description": "The ID of the task to update."
+                    },
+                    "status": {
+                        "type": "string",
+                        "description": "The new status for the task.",
+                        "enum": ["pending", "completed", "deferred"]
+                    }
+                },
+                "required": ["task_id", "status"]
+            }
+        }
+    }
+]
+
 # --- Custom Exceptions ---
 class MemoryOperationError(Exception):
     """Custom exception for memory load/save errors."""
@@ -74,135 +133,219 @@ def save_memory(data, filepath=None):
         logger.error(f"Unexpected error saving memory to {file_to_save}: {e}", exc_info=True)
         raise MemoryOperationError(f"Failed to save memory due to unexpected error: {e}")
 
-# --- Tool/Action Functions ---
-def get_tasks(memory_data, params=None):
-    """Tool to get all tasks."""
-    logger.info(f"Executing tool: get_tasks with params: {params}")
+# --- Dedicated Tool Execution Functions ---
+def _execute_get_tasks(memory_data: dict) -> list:
+    """
+    Retrieves all tasks from memory.
+    Returns a list of task objects.
+    """
+    logger.info("Executing internal tool: _execute_get_tasks")
     return memory_data.get("tasks", [])
 
-def add_task(memory_data, params=None):
-    """Tool to add a new task."""
-    logger.info(f"Executing tool: add_task with params: {params}")
-    if not params or "description" not in params:
-        logger.error("add_task failed: 'description' missing in params.")
-        raise ToolExecutionError("Task description is required for add_task.")
+
+def _execute_add_task(memory_data: dict, description: str, due_date: str = None) -> dict:
+    """
+    Adds a new task to memory.
+    Updates metadata like last_task_id and history (if applicable).
+    Returns the newly created task dictionary.
+    Raises ToolExecutionError if 'description' is missing.
+    """
+    logger.info(f"Executing internal tool: _execute_add_task, Description: '{description}', Due Date: {due_date}")
+    if not description: # Should be caught by schema, but defensive check
+        logger.error("_execute_add_task failed: Description is empty or None.")
+        raise ToolExecutionError("Task description cannot be empty.")
+
+    # Ensure 'metadata' and 'history' keys exist, or initialize them
+    if "metadata" not in memory_data:
+        memory_data["metadata"] = {"last_task_id": 0} # Or other relevant defaults
+    if "history" not in memory_data:
+        memory_data["history"] = []
+
+    last_task_id = memory_data["metadata"].get("last_task_id", 0)
+    new_task_id = last_task_id + 1
     
-    task_id = memory_data.get("next_task_id", 1)
     new_task = {
-        "id": task_id,
-        "description": params["description"],
+        "id": new_task_id,
+        "description": description,
         "status": "pending",
         "created_at": datetime.now().isoformat()
     }
-    if "due_date" in params:
-        new_task["due_date"] = params["due_date"]
+    if due_date:
+        new_task["due_date"] = due_date
         
+    if "tasks" not in memory_data: # Ensure 'tasks' list exists
+        memory_data["tasks"] = []
     memory_data["tasks"].append(new_task)
-    memory_data["next_task_id"] = task_id + 1
-    save_memory(memory_data) # Save after modification
-    logger.info(f"Task {task_id} added: {params['description']}")
+    memory_data["metadata"]["last_task_id"] = new_task_id
+    
+    # Log action to history
+    memory_data["history"].append({
+        "timestamp": datetime.now().isoformat(),
+        "action": "add_task",
+        "task_id": new_task_id,
+        "details": f"Task added: '{description}'"
+    })
+    
+    logger.info(f"Task {new_task_id} added: '{description}'")
     return new_task
 
-def update_task_status(memory_data, params=None):
-    """Tool to update a task's status."""
-    logger.info(f"Executing tool: update_task_status with params: {params}")
-    if not params or "task_id" not in params or "status" not in params:
-        logger.error("update_task_status failed: 'task_id' or 'status' missing in params.")
-        raise ToolExecutionError("task_id and status are required for update_task_status.")
-    
-    try:
-        task_id_to_update = int(params["task_id"])
-    except ValueError:
-        logger.error(f"update_task_status failed: invalid task_id format '{params['task_id']}'. Must be an integer.")
-        raise ToolExecutionError(f"Invalid task_id format: '{params['task_id']}'. Must be an integer.")
 
-    new_status = params["status"]
+def _execute_update_task_status(memory_data: dict, task_id: int, status: str) -> dict | str:
+    """
+    Updates the status of an existing task.
+    Updates 'completed_at' or 'updated_at' timestamps and logs to history.
+    Returns the updated task dictionary if successful, or an error string/dict if not.
+    """
+    logger.info(f"Executing internal tool: _execute_update_task_status, Task ID: {task_id}, New Status: '{status}'")
     
-    for task in memory_data["tasks"]:
-        if task["id"] == task_id_to_update:
-            task["status"] = new_status
+    # Validate status (though schema should handle this)
+    valid_statuses = ["pending", "completed", "deferred"]
+    if status not in valid_statuses:
+        logger.error(f"_execute_update_task_status failed: Invalid status '{status}' for task ID {task_id}.")
+        return {"error": f"Invalid status: {status}. Must be one of {valid_statuses}."}
+
+    task_found = False
+    updated_task_details = None
+    for task in memory_data.get("tasks", []):
+        if task.get("id") == task_id:
+            task["status"] = status
             task["updated_at"] = datetime.now().isoformat()
-            save_memory(memory_data) # Save after modification
-            logger.info(f"Task {task_id_to_update} status updated to {new_status}")
-            return task
+            if status == "completed":
+                task["completed_at"] = datetime.now().isoformat()
             
-    logger.warning(f"update_task_status: Task with id {task_id_to_update} not found.")
-    return {"error": f"Task with id {task_id_to_update} not found."} # Or raise ToolExecutionError
+            task_found = True
+            updated_task_details = task
+            
+            # Log action to history
+            if "history" not in memory_data: memory_data["history"] = []
+            memory_data["history"].append({
+                "timestamp": datetime.now().isoformat(),
+                "action": "update_task_status",
+                "task_id": task_id,
+                "details": f"Task ID {task_id} status updated to '{status}'."
+            })
+            logger.info(f"Task {task_id} status updated to '{status}'.")
+            break
+            
+    if not task_found:
+        logger.warning(f"_execute_update_task_status: Task with ID {task_id} not found.")
+        return {"error": f"Task with ID {task_id} not found."}
+        
+    return updated_task_details
 
-def perform_file_action(action_dict, memory_data):
-    """Performs an action based on the action_dict from LLM."""
-    try:
-        action_name = action_dict["action"] # Expect 'action' key
-        action_params = action_dict.get("params", {}) # 'params' is optional
-    except KeyError as e:
-        logger.error(f"perform_file_action failed: Missing key '{e}' in action_dict: {action_dict}", exc_info=True)
-        raise ToolExecutionError(f"Action dictionary is missing required key: {e}")
-
-    logger.info(f"Attempting to perform action: {action_name} with params: {action_params}")
-    
-    tool_map = {
-        "get_tasks": get_tasks,
-        "add_task": add_task,
-        "update_task_status": update_task_status
-    }
-
-    if action_name in tool_map:
-        try:
-            return tool_map[action_name](memory_data, action_params)
-        except ToolExecutionError as e: # Catch errors from specific tools
-            logger.error(f"Error executing tool {action_name}: {e}", exc_info=True)
-            return {"error": f"Error in {action_name}: {str(e)}"} # Propagate error message
-        except Exception as e: # Catch unexpected errors from tools
-            logger.error(f"Unexpected error executing tool {action_name}: {e}", exc_info=True)
-            return {"error": f"Unexpected error in {action_name}: {str(e)}"}
-    else:
-        logger.error(f"Unknown action requested: {action_name}")
-        return {"error": f"Unknown action: {action_name}"}
 
 # --- LLM Interaction ---
-def process_user_input(user_input, memory_data):
-    """Processes user input using LLM and available tools."""
-    logger.debug(f"Processing user input: '{user_input}'")
+def process_user_input(user_input_text: str, memory_data: dict) -> str:
+    """
+    Processes user input using LiteLLM, deciding whether to call tools or respond directly.
+    Implements structured tool calling if the LLM indicates a tool should be used.
+    """
+    logger.debug(f"Processing user input: '{user_input_text}'")
 
-    prompt = f"""User input: "{user_input}"
-Available tools:
-1. get_tasks: Get all tasks. (JSON: {{"action": "get_tasks"}})
-2. add_task: Add a new task. (JSON: {{"action": "add_task", "params": {{"description": "task description", "due_date": "YYYY-MM-DD" (optional)}}}})
-3. update_task_status: Update a task's status. (JSON: {{"action": "update_task_status", "params": {{"task_id": 123, "status": "completed|pending|deferred"}}}})
-
-Based on the user input, decide if a tool should be used.
-If yes, respond with a JSON object describing the action and its parameters.
-If no tool is needed, or if you need clarification, respond with a natural language message.
-Example action JSON: {{"action": "add_task", "params": {{"description": "Buy groceries"}}}}
-
-Current tasks (first 3 for context only, do not modify directly):
-{json.dumps(memory_data.get('tasks', [])[:3], indent=2)} 
-
-Respond with ONLY the JSON action or a natural language message."""
-    logger.debug(f"Prompt for LLM (model: {MAZKIR_LLM_MODEL}):\n{prompt}")
+    # --- System Prompt Setup ---
+    preferred_tone = memory_data.get('preferences', {}).get('tone', 'neutral')
+    system_prompt = f"You are Mazkir, a helpful personal task assistant. Your tone should be {preferred_tone}."
+    
+    messages = [
+        {"role": "system", "content": system_prompt},
+        {"role": "user", "content": user_input_text}
+    ]
+    logger.debug(f"Initial messages for LLM (model: {MAZKIR_LLM_MODEL}): {messages}")
 
     try:
-        # Check for common API keys for litellm
-        # This check is more for user guidance; LiteLLM handles actual key management.
-        api_key_present = any(os.getenv(key) for key in [
-            "OPENAI_API_KEY", "ANTHROPIC_API_KEY", "COHERE_API_KEY", 
-            "REPLICATE_API_TOKEN", "GEMINI_API_KEY" # Added Gemini as an example
-        ])
-        if not api_key_present and not litellm.mock_response: # Don't warn if mock is intentionally set
-             logger.warning(
-                "No common LLM API key (e.g., OPENAI_API_KEY, ANTHROPIC_API_KEY, GEMINI_API_KEY) "
-                "found in environment. LiteLLM call may fail or use a fallback/mock if not configured globally."
-            )
-        
-        logger.info(f"Sending request to LiteLLM with model: {MAZKIR_LLM_MODEL}")
+        # --- First LiteLLM Call (Tool Decision) ---
+        api_key_present = any(os.getenv(key) for key in ["OPENAI_API_KEY", "ANTHROPIC_API_KEY", "COHERE_API_KEY", "REPLICATE_API_TOKEN", "GEMINI_API_KEY"])
+        if not api_key_present and not getattr(litellm, 'mock_response', None):
+            logger.warning("No common LLM API key found. LiteLLM call may fail or use fallback/mock.")
+
+        logger.info(f"Sending first request to LiteLLM (model: {MAZKIR_LLM_MODEL}) for tool decision.")
         response = litellm.completion(
-            model=MAZKIR_LLM_MODEL, # MAZKIR_LLM_MODEL is read from env at module level
-            messages=[{"content": prompt, "role": "user"}]
-            # Add other parameters like temperature, max_tokens if needed
-            # e.g., temperature=0.7, max_tokens=150
+            model=MAZKIR_LLM_MODEL, messages=messages,
+            tools=MAZKIR_TOOLS_SCHEMAS, tool_choice="auto"
         )
-        llm_output = response.choices[0].message.content.strip()
-        logger.debug(f"Raw LLM Output from {MAZKIR_LLM_MODEL}: {llm_output}")
+        assistant_message = response.choices[0].message
+        messages.append(assistant_message)
+        logger.debug(f"First LLM response from {MAZKIR_LLM_MODEL}: {assistant_message}")
+
+        # --- Tool Call Handling ---
+        if assistant_message.tool_calls:
+            logger.info(f"LLM requested {len(assistant_message.tool_calls)} tool call(s).")
+            tools_executed_successfully = True # Flag to track if all tools ran ok
+
+            for tool_call in assistant_message.tool_calls:
+                tool_name = tool_call.function.name
+                tool_arguments_str = tool_call.function.arguments
+                tool_call_id = tool_call.id
+                logger.info(f"Processing tool call: {tool_name}, ID: {tool_call_id}, Args (str): {tool_arguments_str}")
+
+                try:
+                    tool_arguments_dict = json.loads(tool_arguments_str)
+                except json.JSONDecodeError as e_json:
+                    logger.error(f"JSONDecodeError parsing arguments for tool {tool_name}: {e_json}. Args: {tool_arguments_str}", exc_info=True)
+                    tool_function_result_str = json.dumps({"error": f"Invalid arguments for {tool_name}: {e_json}"})
+                    tools_executed_successfully = False # Mark failure
+                else:
+                    try:
+                        if tool_name == "get_tasks":
+                            tool_function_result = _execute_get_tasks(memory_data)
+                        elif tool_name == "add_task":
+                            desc = tool_arguments_dict.get("description")
+                            due = tool_arguments_dict.get("due_date")
+                            if desc is None: # Schema should prevent, but defensive
+                                raise ToolExecutionError("Missing required parameter: description for add_task")
+                            tool_function_result = _execute_add_task(memory_data, desc, due)
+                        elif tool_name == "update_task_status":
+                            task_id = tool_arguments_dict.get("task_id")
+                            status = tool_arguments_dict.get("status")
+                            if task_id is None or status is None: # Schema should prevent
+                                raise ToolExecutionError("Missing task_id or status for update_task_status")
+                            # Schema defines task_id as integer, so direct use is fine if LLM adheres.
+                            # Add explicit int conversion if strictness is needed here beyond schema.
+                            tool_function_result = _execute_update_task_status(memory_data, int(task_id), status)
+                        else:
+                            logger.warning(f"Unknown tool name requested by LLM: {tool_name}")
+                            tool_function_result = {"error": f"Unknown tool: {tool_name}"}
+                            tools_executed_successfully = False # Mark failure
+                        
+                        # Ensure result is a string for the LLM
+                        if not isinstance(tool_function_result, str):
+                            tool_function_result_str = json.dumps(tool_function_result)
+                        else: # If it's already a string (e.g. error string from update_task_status)
+                            tool_function_result_str = tool_function_result 
+                        
+                        logger.info(f"Tool {tool_name} executed. Result (stringified): {tool_function_result_str[:200]}...")
+
+                    except ToolExecutionError as e_tool_exec:
+                        logger.error(f"ToolExecutionError for {tool_name}: {e_tool_exec}", exc_info=True)
+                        tool_function_result_str = json.dumps({"error": f"Error executing {tool_name}: {e_tool_exec}"})
+                        tools_executed_successfully = False # Mark failure
+                    except Exception as e_tool_other:
+                        logger.error(f"Unexpected error executing tool {tool_name}: {e_tool_other}", exc_info=True)
+                        tool_function_result_str = json.dumps({"error": f"Unexpected error with {tool_name}: {e_tool_other}"})
+                        tools_executed_successfully = False # Mark failure
+                
+                messages.append({"tool_call_id": tool_call_id, "role": "tool", "name": tool_name, "content": tool_function_result_str})
+            
+            # --- Save Memory After All Tool Executions for this turn ---
+            if tools_executed_successfully: # Only save if all tools in the turn were successful (or if partial success is okay)
+                try:
+                    save_memory(memory_data)
+                    logger.info("Memory saved successfully after tool executions.")
+                except MemoryOperationError as e_save:
+                    logger.error(f"CRITICAL: Failed to save memory after tool executions: {e_save}", exc_info=True)
+                    return "Error: Could not save task data after performing actions. Please check logs."
+
+            # --- Second LiteLLM Call (Final Response) ---
+            logger.info(f"Sending second request to LiteLLM (model: {MAZKIR_LLM_MODEL}) for final response.")
+            logger.debug(f"Messages for second LLM call: {messages}")
+            response_final = litellm.completion(model=MAZKIR_LLM_MODEL, messages=messages)
+            final_content = response_final.choices[0].message.content
+            logger.debug(f"Second LLM response from {MAZKIR_LLM_MODEL}: {final_content}")
+            return final_content.strip() if final_content else "Actions performed. No further comment from assistant."
+
+        else: # No tool calls
+            logger.info("No tool calls requested by LLM. Using direct response.")
+            return assistant_message.content.strip() if assistant_message.content else ""
 
     except litellm.exceptions.APIError as e:
         logger.error(f"LiteLLM APIError (model: {MAZKIR_LLM_MODEL}): {e}", exc_info=True)
@@ -213,28 +356,9 @@ Respond with ONLY the JSON action or a natural language message."""
     except litellm.exceptions.ServiceUnavailableError as e:
         logger.error(f"LiteLLM ServiceUnavailableError (model: {MAZKIR_LLM_MODEL}): {e}", exc_info=True)
         return "Error: The AI model service is currently unavailable. Please try again later."
-    except Exception as e: # Catch any other exception from LiteLLM or other issues
-        logger.error(f"Unexpected error calling LiteLLM (model: {MAZKIR_LLM_MODEL}): {e}", exc_info=True)
-        return f"Error: Could not get response from LLM due to an unexpected issue: {e}"
-
-    try:
-        action_dict = json.loads(llm_output)
-        logger.debug(f"LLM output parsed as JSON: {action_dict}")
-        if "action" in action_dict:
-            tool_result = perform_file_action(action_dict, memory_data)
-            return f"Action result: {json.dumps(tool_result)}"
-        else:
-            logger.info("LLM output was JSON but not an action, treating as natural language.")
-            return f"LLM response: {llm_output}" # Valid JSON, but not an action dict
-    except json.JSONDecodeError:
-        logger.info("LLM output was not JSON, treating as natural language response.")
-        return f"LLM response: {llm_output}" # Not JSON
-    except ToolExecutionError as e: # Catch errors from perform_file_action if it raises them directly
-        logger.error(f"Error during tool execution triggered by LLM: {e}", exc_info=True)
-        return f"Error executing requested action: {e}"
     except Exception as e:
-        logger.error(f"Error processing LLM response or executing action: {e}", exc_info=True)
-        return f"Error processing LLM response: {e}"
+        logger.error(f"Unexpected error in process_user_input (model: {MAZKIR_LLM_MODEL}): {e}", exc_info=True)
+        return f"Error: Could not get response from LLM due to an unexpected issue: {e}"
 
 # --- Main Interactive Loop ---
 def run_interactive_mode():

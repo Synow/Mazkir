@@ -4,362 +4,307 @@ import json
 import os
 import tempfile
 from datetime import datetime
-import logging # Added for logger access
+import logging
 
-# Adjust import path if mazkir_refined is in a different directory
-import mazkir_refined
+import mazkir_refined # The module we are testing
 import litellm.exceptions # For mocking specific LiteLLM errors
 
-# Suppress logging during tests to keep output clean
-# You might want to enable it for debugging specific tests
+# Suppress most logging during tests to keep output clean
 mazkir_refined.logger.setLevel(logging.CRITICAL + 1)
 
 
 class TestMazkirRefined(unittest.TestCase):
 
     def setUp(self):
-        """Setup common test data."""
+        """Setup common test data for each test method."""
         self.initial_task_id = 1
-        self.sample_task_1 = {"id": self.initial_task_id, "description": "Test task 1", "status": "pending", "created_at": datetime.now().isoformat()}
-        self.sample_task_2 = {"id": self.initial_task_id + 1, "description": "Test task 2", "status": "pending", "created_at": datetime.now().isoformat()}
+        self.sample_task_1_desc = "Test task 1"
+        self.sample_task_1 = {
+            "id": self.initial_task_id, 
+            "description": self.sample_task_1_desc,
+            "status": "pending", 
+            "created_at": datetime.now().isoformat()
+        }
         
-        self.mock_memory_base = {
+        # Base memory structure, deepcopy in tests if modified
+        self.memory_data_base = {
             "tasks": [],
-            "next_task_id": self.initial_task_id
+            "metadata": {"last_task_id": 0},
+            "history": [],
+            "preferences": {"tone": "neutral"}
         }
 
-    # --- Tests for perform_file_action ---
-    @patch('mazkir_refined.save_memory') # Mock save_memory for most action tests
-    def test_perform_action_get_tasks_empty(self, mock_save_memory):
-        memory_data = {"tasks": [], "next_task_id": 1}
-        action_dict = {"action": "get_tasks"}
-        result = mazkir_refined.perform_file_action(action_dict, memory_data)
+    # --- Tests for Dedicated Tool Execution Functions ---
+    
+    def test_execute_get_tasks_empty(self):
+        memory_data = {"tasks": [], "metadata": {}, "history": []} # Minimal valid structure
+        result = mazkir_refined._execute_get_tasks(memory_data)
         self.assertEqual(result, [])
-        mock_save_memory.assert_not_called() # get_tasks should not save
 
-    @patch('mazkir_refined.save_memory')
-    def test_perform_action_get_tasks_populated(self, mock_save_memory):
-        tasks = [self.sample_task_1, self.sample_task_2]
-        memory_data = {"tasks": tasks, "next_task_id": 3}
-        action_dict = {"action": "get_tasks"}
-        result = mazkir_refined.perform_file_action(action_dict, memory_data)
-        self.assertEqual(result, tasks)
-        mock_save_memory.assert_not_called()
+    def test_execute_get_tasks_populated(self):
+        memory_data = {"tasks": [self.sample_task_1], "metadata": {}, "history": []}
+        result = mazkir_refined._execute_get_tasks(memory_data)
+        self.assertEqual(result, [self.sample_task_1])
 
-    @patch('mazkir_refined.save_memory')
-    def test_perform_action_add_task_valid(self, mock_save_memory):
-        memory_data = {"tasks": [], "next_task_id": 1}
-        task_description = "New laundry task"
-        action_dict = {"action": "add_task", "params": {"description": task_description}}
+    def test_execute_add_task_valid(self):
+        memory_data = {
+            "tasks": [], 
+            "metadata": {"last_task_id": 0}, 
+            "history": []
+        }
+        desc = "New laundry task"
+        due = "2024-12-31"
         
-        result = mazkir_refined.perform_file_action(action_dict, memory_data)
+        new_task = mazkir_refined._execute_add_task(memory_data, desc, due)
         
-        self.assertEqual(result["description"], task_description)
-        self.assertEqual(result["status"], "pending")
-        self.assertEqual(result["id"], 1)
-        self.assertEqual(memory_data["tasks"][-1]["description"], task_description)
-        self.assertEqual(memory_data["next_task_id"], 2)
-        mock_save_memory.assert_called_once_with(memory_data)
+        self.assertEqual(new_task["description"], desc)
+        self.assertEqual(new_task["due_date"], due)
+        self.assertEqual(new_task["status"], "pending")
+        self.assertEqual(new_task["id"], 1)
+        self.assertEqual(memory_data["tasks"][-1]["description"], desc)
+        self.assertEqual(memory_data["metadata"]["last_task_id"], 1)
+        self.assertEqual(len(memory_data["history"]), 1)
+        self.assertEqual(memory_data["history"][0]["action"], "add_task")
 
-    @patch('mazkir_refined.save_memory')
-    def test_perform_action_add_task_missing_description(self, mock_save_memory):
-        memory_data = {"tasks": [], "next_task_id": 1}
-        action_dict = {"action": "add_task", "params": {}} # Missing description
-        
+    def test_execute_add_task_no_due_date(self):
+        memory_data = {"tasks": [], "metadata": {"last_task_id": 5}, "history": []}
+        desc = "Simple task"
+        new_task = mazkir_refined._execute_add_task(memory_data, desc)
+        self.assertEqual(new_task["description"], desc)
+        self.assertNotIn("due_date", new_task)
+        self.assertEqual(new_task["id"], 6) # last_task_id was 5
+        self.assertEqual(memory_data["metadata"]["last_task_id"], 6)
+
+    def test_execute_add_task_missing_description_raises_error(self):
+        memory_data = {"tasks": [], "metadata": {"last_task_id": 0}, "history": []}
         with self.assertRaises(mazkir_refined.ToolExecutionError) as context:
-            mazkir_refined.perform_file_action(action_dict, memory_data)
-        self.assertIn("Task description is required", str(context.exception))
-        mock_save_memory.assert_not_called()
+            mazkir_refined._execute_add_task(memory_data, description="") # Empty description
+        self.assertIn("Task description cannot be empty", str(context.exception))
 
-    @patch('mazkir_refined.save_memory')
-    def test_perform_action_update_task_status_valid(self, mock_save_memory):
-        tasks = [dict(self.sample_task_1), dict(self.sample_task_2)] # Use copies
-        memory_data = {"tasks": tasks, "next_task_id": 3}
-        task_id_to_update = self.sample_task_1["id"]
+    def test_execute_update_task_status_valid(self):
+        task_to_update = dict(self.sample_task_1) # Make a copy
+        memory_data = {"tasks": [task_to_update], "metadata": {"last_task_id": 1}, "history": []}
         new_status = "completed"
-        action_dict = {"action": "update_task_status", "params": {"task_id": task_id_to_update, "status": new_status}}
         
-        result = mazkir_refined.perform_file_action(action_dict, memory_data)
+        updated_task = mazkir_refined._execute_update_task_status(memory_data, self.initial_task_id, new_status)
         
-        self.assertEqual(result["id"], task_id_to_update)
-        self.assertEqual(result["status"], new_status)
-        self.assertIn("updated_at", result)
-        
-        updated_task_in_memory = next(t for t in memory_data["tasks"] if t["id"] == task_id_to_update)
-        self.assertEqual(updated_task_in_memory["status"], new_status)
-        mock_save_memory.assert_called_once_with(memory_data)
+        self.assertEqual(updated_task["status"], new_status)
+        self.assertIn("updated_at", updated_task)
+        self.assertIn("completed_at", updated_task) # Specific to "completed"
+        self.assertEqual(memory_data["tasks"][0]["status"], new_status)
+        self.assertEqual(len(memory_data["history"]), 1)
+        self.assertEqual(memory_data["history"][0]["details"], f"Task ID {self.initial_task_id} status updated to '{new_status}'.")
 
-    @patch('mazkir_refined.save_memory')
-    def test_perform_action_update_task_status_non_existent_id(self, mock_save_memory):
-        memory_data = {"tasks": [self.sample_task_1], "next_task_id": 2}
-        action_dict = {"action": "update_task_status", "params": {"task_id": 999, "status": "completed"}}
-        
-        result = mazkir_refined.perform_file_action(action_dict, memory_data)
+    def test_execute_update_task_status_non_existent_id(self):
+        memory_data = {"tasks": [self.sample_task_1], "metadata": {}, "history": []}
+        result = mazkir_refined._execute_update_task_status(memory_data, 999, "completed")
+        self.assertIsInstance(result, dict)
         self.assertIn("error", result)
-        self.assertIn("not found", result["error"])
-        mock_save_memory.assert_not_called()
+        self.assertIn("Task with ID 999 not found", result["error"])
 
-    @patch('mazkir_refined.save_memory')
-    def test_perform_action_update_task_status_invalid_id_format(self, mock_save_memory):
-        memory_data = {"tasks": [self.sample_task_1], "next_task_id": 2}
-        action_dict = {"action": "update_task_status", "params": {"task_id": "abc", "status": "completed"}}
-        
-        with self.assertRaises(mazkir_refined.ToolExecutionError) as context:
-            mazkir_refined.perform_file_action(action_dict, memory_data)
-        self.assertIn("Invalid task_id format", str(context.exception))
-        mock_save_memory.assert_not_called()
-        
-    @patch('mazkir_refined.save_memory')
-    def test_perform_action_unknown_action(self, mock_save_memory):
-        memory_data = {"tasks": [], "next_task_id": 1}
-        action_dict = {"action": "non_existent_action", "params": {}}
-        result = mazkir_refined.perform_file_action(action_dict, memory_data)
+    def test_execute_update_task_status_invalid_status(self):
+        memory_data = {"tasks": [self.sample_task_1], "metadata": {}, "history": []}
+        result = mazkir_refined._execute_update_task_status(memory_data, self.initial_task_id, "invalid_status_string")
+        self.assertIsInstance(result, dict)
         self.assertIn("error", result)
-        self.assertIn("Unknown action", result["error"])
-        mock_save_memory.assert_not_called()
+        self.assertIn("Invalid status: invalid_status_string", result["error"])
 
+    # --- Tests for process_user_input (Structured Tool Calling) ---
+
+    @patch('mazkir_refined.litellm.completion')
+    def test_process_input_direct_llm_answer(self, mock_litellm_completion):
+        memory_data = self.memory_data_base.copy()
+        user_message = "Just a friendly chat."
+        llm_direct_answer = "Hello there! How can I help you today?"
+
+        # Mock first and only LLM call
+        mock_response1 = MagicMock()
+        mock_response1.choices[0].message.tool_calls = None # No tool calls
+        mock_response1.choices[0].message.content = llm_direct_answer
+        mock_litellm_completion.return_value = mock_response1
+        
+        result = mazkir_refined.process_user_input(user_message, memory_data)
+        
+        self.assertEqual(result, llm_direct_answer)
+        mock_litellm_completion.assert_called_once() # Only one call expected
+
+    @patch('mazkir_refined._execute_add_task')
+    @patch('mazkir_refined.litellm.completion')
+    @patch('mazkir_refined.save_memory') # Mock save_memory to prevent actual file writes during this test
+    def test_process_input_successful_tool_call_add_task(self, mock_save_memory, mock_litellm_completion, mock_execute_add_task):
+        memory_data = self.memory_data_base.copy()
+        user_message = "Add a task: Buy groceries tomorrow"
+        
+        # 1. Mock first LLM call (requests tool use)
+        mock_llm_response1 = MagicMock()
+        tool_call_id = "call_123"
+        tool_arguments_str = '{"description": "Buy groceries", "due_date": "tomorrow"}'
+        mock_llm_response1.choices[0].message.tool_calls = [MagicMock()]
+        mock_llm_response1.choices[0].message.tool_calls[0].id = tool_call_id
+        mock_llm_response1.choices[0].message.tool_calls[0].function.name = "add_task"
+        mock_llm_response1.choices[0].message.tool_calls[0].function.arguments = tool_arguments_str
+        mock_llm_response1.choices[0].message.content = None # Often None when tool_calls are present
+        
+        # 2. Mock the tool execution function
+        tool_execution_result = {"id": 1, "description": "Buy groceries", "due_date": "tomorrow", "status": "pending"}
+        mock_execute_add_task.return_value = tool_execution_result
+        
+        # 3. Mock second LLM call (summarizes tool result)
+        mock_llm_response2 = MagicMock()
+        final_summary = "Okay, I've added 'Buy groceries' due tomorrow to your tasks."
+        mock_llm_response2.choices[0].message.content = final_summary
+        
+        # Set up side_effect for multiple calls to litellm.completion
+        mock_litellm_completion.side_effect = [mock_llm_response1, mock_llm_response2]
+        
+        # --- Act ---
+        result = mazkir_refined.process_user_input(user_message, memory_data)
+        
+        # --- Assert ---
+        self.assertEqual(mock_litellm_completion.call_count, 2)
+        
+        # Assert call to _execute_add_task
+        mock_execute_add_task.assert_called_once_with(
+            memory_data, 
+            description="Buy groceries", 
+            due_date="tomorrow"
+        )
+        
+        # Assert messages for the second LLM call
+        args_second_call, kwargs_second_call = mock_litellm_completion.call_args_list[1]
+        messages_for_second_call = kwargs_second_call['messages']
+        
+        self.assertEqual(len(messages_for_second_call), 3) # System, User, Assistant (with tool_call), Tool Result
+        self.assertEqual(messages_for_second_call[2]["role"], "assistant") # Assistant's first response
+        self.assertTrue(hasattr(messages_for_second_call[2], 'tool_calls')) # Check if it's a MagicMock with tool_calls
+
+        self.assertEqual(messages_for_second_call[-1]["role"], "tool")
+        self.assertEqual(messages_for_second_call[-1]["tool_call_id"], tool_call_id)
+        self.assertEqual(messages_for_second_call[-1]["name"], "add_task")
+        self.assertEqual(messages_for_second_call[-1]["content"], json.dumps(tool_execution_result))
+        
+        # Assert final result
+        self.assertEqual(result, final_summary)
+        mock_save_memory.assert_called_once_with(memory_data) # Check if memory was saved
+
+    @patch('mazkir_refined.litellm.completion')
     @patch('mazkir_refined.save_memory')
-    def test_perform_action_missing_action_key(self, mock_save_memory):
-        memory_data = {"tasks": [], "next_task_id": 1}
-        action_dict = {"params": {}} # Missing "action" key
-        with self.assertRaises(mazkir_refined.ToolExecutionError) as context:
-            mazkir_refined.perform_file_action(action_dict, memory_data)
-        self.assertIn("missing required key", str(context.exception).lower())
-        mock_save_memory.assert_not_called()
+    def test_process_input_tool_arg_parsing_error(self, mock_save_memory, mock_litellm_completion):
+        memory_data = self.memory_data_base.copy()
+        user_message = "Call a tool with bad args"
 
+        # 1. Mock first LLM call (requests tool use with malformed args)
+        mock_llm_response1 = MagicMock()
+        tool_call_id = "call_bad_args"
+        malformed_tool_arguments_str = '{"description": "Buy milk", "due_date": tomorrow_no_quotes}' # Malformed
+        mock_llm_response1.choices[0].message.tool_calls = [MagicMock()]
+        mock_llm_response1.choices[0].message.tool_calls[0].id = tool_call_id
+        mock_llm_response1.choices[0].message.tool_calls[0].function.name = "add_task"
+        mock_llm_response1.choices[0].message.tool_calls[0].function.arguments = malformed_tool_arguments_str
+        mock_llm_response1.choices[0].message.content = None
 
-    # --- Tests for process_user_input ---
-    @patch('mazkir_refined.litellm.completion')
-    @patch('mazkir_refined.perform_file_action') # We don't need load_memory mock if process_user_input takes memory_data
-    def test_process_input_direct_llm_answer(self, mock_perform_action, mock_litellm_completion):
-        memory_data = self.mock_memory_base.copy()
-        user_message = "Hello, how are you?"
-        llm_response_content = "I am fine, thank you!"
+        # 2. Mock second LLM call (should receive error info)
+        mock_llm_response2 = MagicMock()
+        final_error_summary = "It seems there was an issue with the arguments for adding the task."
+        mock_llm_response2.choices[0].message.content = final_error_summary
         
-        mock_llm_response = MagicMock()
-        mock_llm_response.choices[0].message.content = llm_response_content
-        mock_litellm_completion.return_value = mock_llm_response
-        
+        mock_litellm_completion.side_effect = [mock_llm_response1, mock_llm_response2]
+
         result = mazkir_refined.process_user_input(user_message, memory_data)
         
-        self.assertEqual(result, f"LLM response: {llm_response_content}")
-        mock_litellm_completion.assert_called_once()
-        mock_perform_action.assert_not_called()
+        self.assertEqual(mock_litellm_completion.call_count, 2)
+        args_second_call, kwargs_second_call = mock_litellm_completion.call_args_list[1]
+        messages_for_second_call = kwargs_second_call['messages']
+        
+        tool_result_message = messages_for_second_call[-1]
+        self.assertEqual(tool_result_message["role"], "tool")
+        self.assertIn("error", tool_result_message["content"].lower())
+        self.assertIn("invalid arguments", tool_result_message["content"].lower())
+        
+        self.assertEqual(result, final_error_summary)
+        mock_save_memory.assert_not_called() # Save should not happen if tool parsing fails
 
+    @patch('mazkir_refined._execute_update_task_status')
     @patch('mazkir_refined.litellm.completion')
-    @patch('mazkir_refined.perform_file_action')
-    def test_process_input_llm_requests_get_tasks(self, mock_perform_action, mock_litellm_completion):
-        memory_data = self.mock_memory_base.copy()
-        user_message = "Show my tasks"
-        action_json = '{"action": "get_tasks"}'
-        tool_result_data = [{"id": 1, "description": "A task"}]
+    @patch('mazkir_refined.save_memory')
+    def test_process_input_internal_tool_execution_error(self, mock_save_memory, mock_litellm_completion, mock_execute_update_task_status):
+        memory_data = self.memory_data_base.copy()
+        user_message = "Update task 999 to completed"
+
+        # 1. Mock first LLM call
+        mock_llm_response1 = MagicMock()
+        tool_call_id = "call_tool_fail"
+        tool_arguments_str = '{"task_id": 999, "status": "completed"}'
+        mock_llm_response1.choices[0].message.tool_calls = [MagicMock()]
+        mock_llm_response1.choices[0].message.tool_calls[0].id = tool_call_id
+        mock_llm_response1.choices[0].message.tool_calls[0].function.name = "update_task_status"
+        mock_llm_response1.choices[0].message.tool_calls[0].function.arguments = tool_arguments_str
         
-        # Simulate LLM returning action JSON
-        mock_llm_response_action = MagicMock()
-        mock_llm_response_action.choices[0].message.content = action_json
-        mock_litellm_completion.return_value = mock_llm_response_action
+        # 2. Mock tool execution to return an error
+        tool_error_result = {"error": "Task with ID 999 not found."}
+        mock_execute_update_task_status.return_value = tool_error_result
         
-        # Simulate perform_file_action returning tasks
-        mock_perform_action.return_value = tool_result_data
+        # 3. Mock second LLM call
+        mock_llm_response2 = MagicMock()
+        final_error_summary = "I couldn't update task 999 as it was not found."
+        mock_llm_response2.choices[0].message.content = final_error_summary
         
+        mock_litellm_completion.side_effect = [mock_llm_response1, mock_llm_response2]
+
         result = mazkir_refined.process_user_input(user_message, memory_data)
         
-        expected_action_dict = json.loads(action_json)
-        mock_perform_action.assert_called_once_with(expected_action_dict, memory_data)
-        self.assertEqual(result, f"Action result: {json.dumps(tool_result_data)}")
-
-    @patch('mazkir_refined.litellm.completion')
-    @patch('mazkir_refined.perform_file_action')
-    def test_process_input_llm_requests_add_task(self, mock_perform_action, mock_litellm_completion):
-        memory_data = self.mock_memory_base.copy()
-        user_message = "Add task: Buy milk"
-        action_json = '{"action": "add_task", "params": {"description": "Buy milk"}}'
-        tool_result_data = {"id": 1, "description": "Buy milk", "status": "pending"}
-
-        mock_llm_response_action = MagicMock()
-        mock_llm_response_action.choices[0].message.content = action_json
-        mock_litellm_completion.return_value = mock_llm_response_action
-        mock_perform_action.return_value = tool_result_data
+        self.assertEqual(mock_litellm_completion.call_count, 2)
+        mock_execute_update_task_status.assert_called_once_with(memory_data, 999, "completed")
         
-        result = mazkir_refined.process_user_input(user_message, memory_data)
+        args_second_call, kwargs_second_call = mock_litellm_completion.call_args_list[1]
+        messages_for_second_call = kwargs_second_call['messages']
+        tool_result_message = messages_for_second_call[-1]
+        self.assertEqual(tool_result_message["role"], "tool")
+        self.assertEqual(tool_result_message["content"], json.dumps(tool_error_result))
         
-        expected_action_dict = json.loads(action_json)
-        mock_perform_action.assert_called_once_with(expected_action_dict, memory_data)
-        self.assertEqual(result, f"Action result: {json.dumps(tool_result_data)}")
-
-    @patch('mazkir_refined.litellm.completion')
-    @patch('mazkir_refined.perform_file_action')
-    def test_process_input_malformed_json_from_llm(self, mock_perform_action, mock_litellm_completion):
-        memory_data = self.mock_memory_base.copy()
-        user_message = "Do something strange"
-        malformed_json_response = "{'action': 'get_tasks', 'params': {}" # Missing closing brace
-        
-        mock_llm_response = MagicMock()
-        mock_llm_response.choices[0].message.content = malformed_json_response
-        mock_litellm_completion.return_value = mock_llm_response
-        
-        result = mazkir_refined.process_user_input(user_message, memory_data)
-        
-        self.assertEqual(result, f"LLM response: {malformed_json_response}")
-        mock_perform_action.assert_not_called()
-
-    @patch('mazkir_refined.litellm.completion')
-    @patch('mazkir_refined.perform_file_action')
-    def test_process_input_llm_api_error(self, mock_perform_action, mock_litellm_completion):
-        memory_data = self.mock_memory_base.copy()
-        user_message = "Trigger API error"
-        
-        mock_litellm_completion.side_effect = litellm.exceptions.APIError("Simulated API Error from LiteLLM")
-        result = mazkir_refined.process_user_input(user_message, memory_data)
-        self.assertIn("Error: The AI model API returned an error: Simulated API Error from LiteLLM", result)
-        mock_perform_action.assert_not_called()
-
-    @patch('mazkir_refined.litellm.completion')
-    @patch('mazkir_refined.perform_file_action')
-    def test_process_input_llm_timeout_error(self, mock_perform_action, mock_litellm_completion):
-        memory_data = self.mock_memory_base.copy()
-        user_message = "Trigger Timeout error"
-        
-        mock_litellm_completion.side_effect = litellm.exceptions.TimeoutError("Simulated Timeout from LiteLLM")
-        result = mazkir_refined.process_user_input(user_message, memory_data)
-        self.assertIn("Error: The request to the AI model timed out. Please try again later.", result)
-        mock_perform_action.assert_not_called()
-
-    @patch('mazkir_refined.litellm.completion')
-    @patch('mazkir_refined.perform_file_action')
-    def test_process_input_llm_service_unavailable_error(self, mock_perform_action, mock_litellm_completion):
-        memory_data = self.mock_memory_base.copy()
-        user_message = "Trigger Service Unavailable error"
-        
-        mock_litellm_completion.side_effect = litellm.exceptions.ServiceUnavailableError("Simulated Service Unavailable from LiteLLM")
-        result = mazkir_refined.process_user_input(user_message, memory_data)
-        self.assertIn("Error: The AI model service is currently unavailable. Please try again later.", result)
-        mock_perform_action.assert_not_called()
-
-    @patch('mazkir_refined.litellm.completion')
-    @patch('mazkir_refined.perform_file_action')
-    def test_process_input_llm_generic_exception(self, mock_perform_action, mock_litellm_completion):
-        memory_data = self.mock_memory_base.copy()
-        user_message = "Trigger generic error"
-        
-        mock_litellm_completion.side_effect = Exception("Some generic unexpected error")
-        result = mazkir_refined.process_user_input(user_message, memory_data)
-        self.assertIn("Error: Could not get response from LLM due to an unexpected issue: Some generic unexpected error", result)
-        mock_perform_action.assert_not_called()
-        
-    @patch.dict(os.environ, {"MAZKIR_LLM_MODEL": "test-model-from-env"})
-    @patch('mazkir_refined.litellm.completion') 
-    @patch('mazkir_refined.perform_file_action')
-    def test_process_input_uses_configured_llm_model(self, mock_perform_action, mock_litellm_completion):
-        # This reloads mazkir_refined to pick up the patched environment variable at module load time for MAZKIR_LLM_MODEL
-        # This is a bit advanced; simpler alternative is to patch mazkir_refined.MAZKIR_LLM_MODEL directly.
-        import importlib
-        importlib.reload(mazkir_refined) # Reload to ensure MAZKIR_LLM_MODEL is read from patched env
-        
-        memory_data = self.mock_memory_base.copy()
-        user_message = "Hello"
-        llm_response_content = "Hi there from test-model-from-env!"
-        
-        mock_llm_response = MagicMock()
-        mock_llm_response.choices[0].message.content = llm_response_content
-        mock_litellm_completion.return_value = mock_llm_response
-        
-        mazkir_refined.process_user_input(user_message, memory_data)
-        
-        mock_litellm_completion.assert_called_once()
-        args, kwargs = mock_litellm_completion.call_args
-        self.assertEqual(kwargs.get('model'), "test-model-from-env")
-
-        # Clean up: Restore original MAZKIR_LLM_MODEL or remove the env var if it wasn't there
-        del os.environ['MAZKIR_LLM_MODEL']
-        importlib.reload(mazkir_refined) # Reload again to restore original state
+        self.assertEqual(result, final_error_summary)
+        mock_save_memory.assert_not_called() # Save should not occur if the tool indicates an error that prevents state change
 
     # --- Tests for load_memory and save_memory (File I/O) ---
+    # These tests remain largely the same as they are not directly affected by tool calling logic.
     def test_save_and_load_memory_integration(self):
-        """Test saving and then loading memory using a temporary file."""
         temp_file_descriptor, temp_file_path = tempfile.mkstemp(suffix=".json")
-        os.close(temp_file_descriptor) # Close the descriptor, we just need the path
-
+        os.close(temp_file_descriptor)
         try:
-            # Test save_memory
             data_to_save = {
                 "tasks": [self.sample_task_1],
-                "next_task_id": self.initial_task_id + 1
+                "metadata": {"last_task_id": self.initial_task_id + 1},
+                "history": [{"action": "test"}],
+                "preferences": {"tone": "witty"}
             }
             mazkir_refined.save_memory(data_to_save, filepath=temp_file_path)
-
-            # Verify file content (optional, but good for confidence)
-            with open(temp_file_path, 'r') as f:
-                content_on_disk = json.load(f)
-            self.assertEqual(content_on_disk["tasks"][0]["description"], self.sample_task_1["description"])
-            self.assertEqual(content_on_disk["next_task_id"], self.initial_task_id + 1)
-
-            # Test load_memory
             loaded_data = mazkir_refined.load_memory(filepath=temp_file_path)
-            self.assertEqual(len(loaded_data["tasks"]), 1)
-            self.assertEqual(loaded_data["tasks"][0]["description"], self.sample_task_1["description"])
-            self.assertEqual(loaded_data["next_task_id"], self.initial_task_id + 1)
-
+            self.assertEqual(loaded_data, data_to_save)
         finally:
-            os.remove(temp_file_path) # Clean up
+            os.remove(temp_file_path)
 
     def test_load_memory_file_not_found(self):
-        """Test load_memory when the file does not exist."""
-        # Using a non-existent file path
         non_existent_path = os.path.join(tempfile.gettempdir(), "non_existent_mazkir_mem.json")
-        if os.path.exists(non_existent_path): # Ensure it doesn't exist
-             os.remove(non_existent_path)
-
+        if os.path.exists(non_existent_path): os.remove(non_existent_path)
         loaded_data = mazkir_refined.load_memory(filepath=non_existent_path)
-        
-        # Should return default structure
-        self.assertEqual(loaded_data["tasks"], [])
-        self.assertEqual(loaded_data["next_task_id"], 1)
-    
-    def test_load_memory_json_decode_error(self):
-        """Test load_memory with a corrupted JSON file."""
-        temp_file_descriptor, temp_file_path = tempfile.mkstemp(suffix=".json")
-        
-        try:
-            # Write malformed JSON to the temp file
-            with os.fdopen(temp_file_descriptor, 'w') as f:
-                f.write("{'tasks': [") # Malformed JSON
+        self.assertEqual(loaded_data, {"tasks": [], "next_task_id": 1}) # Default structure
 
+    def test_load_memory_json_decode_error(self):
+        temp_file_descriptor, temp_file_path = tempfile.mkstemp(suffix=".json")
+        try:
+            with os.fdopen(temp_file_descriptor, 'w') as f: f.write("{'tasks': [") # Malformed
             loaded_data = mazkir_refined.load_memory(filepath=temp_file_path)
-            
-            # Should return default structure due to JSONDecodeError
-            self.assertEqual(loaded_data["tasks"], [])
-            self.assertEqual(loaded_data["next_task_id"], 1)
+            self.assertEqual(loaded_data, {"tasks": [], "next_task_id": 1}) # Default
         finally:
-            if os.path.exists(temp_file_path):
-                os.remove(temp_file_path)
+            if os.path.exists(temp_file_path): os.remove(temp_file_path)
 
     def test_save_memory_io_error(self):
-        """Test save_memory when an IOError occurs (e.g., read-only path)."""
-        # This is harder to reliably simulate cross-platform without admin rights
-        # Mocking open to raise IOError is a more controlled way for a unit test
         with patch('builtins.open', mock_open()) as mock_file:
             mock_file.side_effect = IOError("Simulated Disk Full")
-            data_to_save = {"tasks": [], "next_task_id": 1}
-            
+            data_to_save = {"tasks": [], "metadata": {}, "history": []}
             with self.assertRaises(mazkir_refined.MemoryOperationError) as context:
-                # Use default path which will be mocked
-                mazkir_refined.save_memory(data_to_save, filepath="/non_existent_dir/some_file.json") 
+                mazkir_refined.save_memory(data_to_save, filepath="/read_only_path/mem.json")
             self.assertIn("IOError saving memory", str(context.exception))
 
-
 if __name__ == '__main__':
-    # This allows running tests directly from the command line
-    # You might need to adjust Python's path if mazkir_refined is not directly importable
-    # e.g., by setting PYTHONPATH or modifying sys.path
-    # For simplicity, this assumes mazkir_refined.py is in the same directory or PYTHONPATH
-    
-    # If litellm is not installed, some tests might behave differently or fail.
-    # The tests for specific litellm exceptions would fail if litellm.exceptions module isn't available.
-    # For this exercise, we assume litellm is available in the test environment.
-
-    # Setup logging for tests - can be useful for debugging
-    # logging.basicConfig(stream=sys.stderr, level=logging.DEBUG) # Or INFO
-    # mazkir_refined.logger.setLevel(logging.DEBUG) # Set level for the module's logger
-    
     unittest.main()
