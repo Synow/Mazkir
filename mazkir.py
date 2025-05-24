@@ -254,7 +254,7 @@ def perform_file_action(action_dict, user_data, user_id_for_save):
 
 # --- LLM Interaction ---
 # This function now requires user_id to load/save correct data and to pass for tool saving.
-def process_user_input(user_id: str, user_input_text: str):
+def process_user_input(user_id: str, user_input_text: str, message_history: list[str] = None):
     """Processes user input using LLM and available tools for a specific user."""
     
     # Load the specific user's data
@@ -320,7 +320,17 @@ def process_user_input(user_id: str, user_input_text: str):
         }
     ]
 
-    prompt = f"""User input: "{user_input_text}"
+    history_prompt_segment = ""
+    if message_history:
+        history_prompt_segment = "Previous messages:\n"
+        # Assuming message_history is a list of user messages as per current TelegramHandler
+        # If assistant messages were also stored, the formatting would need to differentiate.
+        for msg in message_history:
+            history_prompt_segment += f"- User: {msg}\n" # Corrected to use 'User:' as per example
+        history_prompt_segment += "\n"
+
+    prompt = f"""{history_prompt_segment}Current user input: "{user_input_text}"
+
 
 Based on the user input, decide if a tool should be used to manage tasks.
 If a tool is appropriate, use it by calling the function. Otherwise, respond in natural language.

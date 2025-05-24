@@ -34,6 +34,8 @@ class TelegramHandler(BaseHandler):
 
         self.application = ApplicationBuilder().token(self.bot_token).build()
         logger.info("Telegram Application built.")
+        self.user_message_history: dict[str, list[str]] = {}
+
 
     def get_user_identifier(self, update: Update) -> str:
         """
@@ -77,13 +79,24 @@ class TelegramHandler(BaseHandler):
         text = update.message.text
 
         logger.info(f"Received message from internal_user_id: {user_id_internal} (chat_id: {chat_id}, content snippet: '{text[:50]}...')")
+        # Retrieve message history
+        user_history = self.user_message_history.get(user_id_internal, [])
+        user_history.append(text)
+        # Keep only the last 10 messages
+        self.user_message_history[user_id_internal] = user_history[-10:]
+        logger.debug(f"Updated message history for {user_id_internal}. History length: {len(self.user_message_history[user_id_internal])}")
+
 
         assistant_response = "An error occurred while processing your request." # Default error
         try:
             # Call the core processing function (e.g., mazkir.process_user_input)
             # This function is expected to handle its own exceptions regarding memory/tool use
             # and return a string response.
-            assistant_response = self.process_user_input_func(user_id_internal, text)
+            assistant_response = self.process_user_input_func(
+                user_id_internal, 
+                text, 
+                message_history=self.user_message_history.get(user_id_internal, [])
+            )
             logger.debug(f"Core processing for {user_id_internal} returned: '{assistant_response[:100]}...'")
 
         except MemoryOperationError as e_mem: # Should be caught by process_user_input, but as a fallback
