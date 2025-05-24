@@ -71,8 +71,8 @@ def main():
     parser.add_argument(
         "--max_turns",
         type=int,
-        default=DEFAULT_MAX_TURNS,
-        help=f"Maximum number of game turns. Defaults to {DEFAULT_MAX_TURNS}."
+        default=10, # Changed default to 10
+        help=f"Maximum number of game turns. Defaults to 10." # Updated help text
     )
     parser.add_argument(
         "--log_file",

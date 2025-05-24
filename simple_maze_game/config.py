@@ -26,7 +26,7 @@ LLM_TOOLS_MAZE = [
 # Default game settings
 DEFAULT_MAZE_WIDTH = 10
 DEFAULT_MAZE_HEIGHT = 10
-DEFAULT_MAX_TURNS = 50 # (width * height / 2) might be a dynamic option
+DEFAULT_MAX_TURNS = 10 # Enforce a 10-turn limit
 DEFAULT_AGENT_START = (0, 0) # Default start position
 DEFAULT_TARGET_POS = (DEFAULT_MAZE_WIDTH -1, DEFAULT_MAZE_HEIGHT -1) # Default target position
 

@@ -81,14 +81,20 @@ def play_maze_game(
 
     conversation_history = []
     system_prompt = (
-        "You are an agent navigating a maze. Your goal is to reach the target location ('T'). "
-        "You will be given your current position ('A'), the target position, and your current score "
-        "(closer to target is better, score is negative Manhattan distance). Use the 'move' tool to navigate. "
+        "You are an agent navigating a maze. Your goal is to reach the target location ('T') within 10 turns. "
+        "The game has a strict 10-turn limit. Manage your moves carefully. "
+        "Each turn consists of two steps: "
+        "1. Commentary: You will first provide a brief (one sentence) assessment of your current situation, "
+        "including your planned move direction (e.g., 'up', 'down', 'left', 'right'). Do not call any tools at this stage. "
+        "2. Action: After providing commentary, you will be prompted again to make your move. At this point, "
+        "you must use the 'move' tool with your chosen direction. "
+        "You will be given your current position ('A'), the target position ('T'), and your current score "
+        "(closer to target is better, score is negative Manhattan distance). "
         "The maze is a grid, 0-indexed. (0,0) is top-left. 'X' represents obstacles, '.' is empty space."
     )
     conversation_history.append({"role": "system", "content": system_prompt})
 
-    last_action_result = {"message": f"Game started. Agent at {game.maze.get_agent_position()}, Target at {game.maze.get_target_position()}. Max turns: {game.max_turns}."}
+    last_action_result = {"message": f"Game started. Agent at {game.maze.get_agent_position()}, Target at {game.maze.get_target_position()}. You have {game.max_turns} turns to reach the target."}
 
     # Clear log file
     with open(log_filename, "w") as f:
@@ -105,81 +111,114 @@ def play_maze_game(
     while not game.game_over:
         current_status = game.get_status()
         maze_representation = format_maze_for_llm(game)
-
-        user_prompt_content = (
-            f"Turn: {current_status['turn_count']}/{current_status['max_turns']}\n"
-            f"Agent Position ('A'): {current_status['agent_position']}\n"
-            f"Target Position ('T'): {current_status['target_position']}\n"
-            f"Current Score: {current_status['score']}\n"
-            f"Last Move Result: {last_action_result.get('message', 'N/A')}\n\n"
-            "Maze Layout:\n"
-            f"{maze_representation}\n\n"
-            "Choose your next move ('up', 'down', 'left', 'right')."
-        )
         
         # Prune history (optional, good for very long games)
-        MAX_HISTORY_MESSAGES = 10 
+        MAX_HISTORY_MESSAGES = 15 # Increased slightly due to 2-phase interaction
         if len(conversation_history) > MAX_HISTORY_MESSAGES:
             conversation_history = [conversation_history[0]] + conversation_history[-(MAX_HISTORY_MESSAGES-1):]
 
-        conversation_history.append({"role": "user", "content": user_prompt_content})
-        
-        llm_response_obj = None
-        chosen_tool_name = "None"
-        chosen_params = {}
+        print(f"\n--- Turn {current_status['turn_count']} ---")
+        print(f"Agent: {current_status['agent_position']}, Target: {current_status['target_position']}, Score: {current_status['score']}")
+        print(f"Last Result: {last_action_result.get('message', 'N/A')}")
+        print("Maze:\n" + maze_representation)
 
-        log_entry_pre_action = {
-            "turn": current_status['turn_count'],
-            "agent_position_before": current_status['agent_position'],
-            "score_before": current_status['score'],
-            "llm_prompt": user_prompt_content,
-        }
+        # Phase 1: Get Commentary
+        prompt_for_commentary = (
+            f"Turn {current_status['turn_count']}/{current_status['max_turns']}. Score: {current_status['score']}.\n"
+            f"Agent at {current_status['agent_position']}, Target at {current_status['target_position']}.\n"
+            f"Last move result: {last_action_result.get('message', 'N/A')}\n"
+            "Maze:\n"
+            f"{maze_representation}\n"
+            "Provide a brief (one sentence) commentary on your situation and your planned move direction (up, down, left, or right). Do not use tools."
+        )
+        conversation_history.append({"role": "user", "content": prompt_for_commentary})
+        
+        llm_commentary = "No commentary received."
+        llm_commentary_response_obj = None
+        commentary_error = False
 
         try:
-            print(f"\n--- Turn {current_status['turn_count']} ---")
-            print(f"Agent: {current_status['agent_position']}, Target: {current_status['target_position']}, Score: {current_status['score']}")
-            print(f"Last Result: {last_action_result.get('message', 'N/A')}")
-            print("Maze:\n" + maze_representation)
-            print("LLM is thinking...")
-
-            response = litellm.completion(
+            print("LLM is thinking (for commentary)...")
+            commentary_response = litellm.completion(
                 model=llm_model_to_use,
-                messages=conversation_history,
-                tools=LLM_TOOLS_MAZE,
-                tool_choice="auto" # Could be "required"
+                messages=conversation_history
+                # No tools or tool_choice here
             )
-            llm_response_obj = response # For logging
+            llm_commentary_response_obj = commentary_response # For logging
+            if commentary_response.choices and commentary_response.choices[0].message.content:
+                llm_commentary = commentary_response.choices[0].message.content.strip()
+                print(f"LLM Commentary: {llm_commentary}")
+            else:
+                llm_commentary = "LLM provided no commentary text."
+                print(f"Warning: {llm_commentary}")
+                commentary_error = True # Counts as a minor error, LLM didn't follow instructions
+            conversation_history.append({"role": "assistant", "content": llm_commentary})
+        except Exception as e:
+            print(f"Error getting LLM commentary: {e}")
+            llm_commentary = f"Error obtaining commentary: {e}"
+            commentary_error = True
+            # Add a placeholder assistant message for the error to keep history consistent
+            conversation_history.append({"role": "assistant", "content": llm_commentary})
 
-            if response.choices and response.choices[0].message.tool_calls:
-                tool_call = response.choices[0].message.tool_calls[0]
-                chosen_tool_name = tool_call.function.name
-                arguments_str = tool_call.function.arguments
-                
-                try:
-                    chosen_params = json.loads(arguments_str)
-                except json.JSONDecodeError as e:
-                    print(f"Error: LLM provided malformed JSON arguments: {arguments_str}. Error: {e}")
-                    last_action_result = game.tool_move("invalid_direction_due_to_json_error") # Penalize turn
-                    last_action_result["message"] = f"LLM error (malformed JSON): {arguments_str}. Move failed." # Overwrite message
-                    conversation_history.append({"role": "assistant", "content": response.choices[0].message.content or "", "tool_calls": response.choices[0].message.tool_calls})
-                    chosen_tool_name = "error_json_decode"
-                
-                if chosen_tool_name == "move":
-                    direction = chosen_params.get("direction")
-                    if direction:
-                        print(f"LLM chose: move, Direction: {direction}")
-                        last_action_result = game.tool_move(direction)
-                    else:
-                        print(f"LLM chose 'move' but no direction provided. Args: {arguments_str}")
-                        # Penalize turn, treat as invalid move
-                        last_action_result = game.tool_move("invalid_direction_due_to_missing_param") 
-                        last_action_result["message"] = "LLM chose 'move' but did not specify a direction. Move failed."
+
+        # Phase 2: Get Move Action
+        chosen_tool_name = "None"
+        chosen_params = {}
+        llm_move_response_obj = None
+
+        if commentary_error: # If commentary failed, we might still try to get a move or penalize
+            last_action_result = game.tool_move("error_during_commentary_phase")
+            last_action_result["message"] = f"Skipped move due to error in commentary phase. Commentary: {llm_commentary}"
+            print(last_action_result["message"])
+        else:
+            prompt_for_move = (
+                f"Your commentary: \"{llm_commentary}\"\n"
+                "Now, execute your planned move using the 'move' tool."
+            )
+            conversation_history.append({"role": "user", "content": prompt_for_move})
+            
+            try:
+                print("LLM is thinking (for move)...")
+                move_response = litellm.completion(
+                    model=llm_model_to_use,
+                    messages=conversation_history,
+                    tools=LLM_TOOLS_MAZE,
+                    tool_choice="auto" 
+                )
+                llm_move_response_obj = move_response # For logging
+
+                if move_response.choices and move_response.choices[0].message.tool_calls:
+                    tool_call = move_response.choices[0].message.tool_calls[0]
+                    chosen_tool_name = tool_call.function.name
+                    arguments_str = tool_call.function.arguments
                     
+                    try:
+                        chosen_params = json.loads(arguments_str)
+                    except json.JSONDecodeError as e:
+                        print(f"Error: LLM provided malformed JSON arguments for move: {arguments_str}. Error: {e}")
+                        last_action_result = game.tool_move("invalid_direction_due_to_json_error")
+                        last_action_result["message"] = f"LLM error (malformed JSON for move): {arguments_str}. Move failed."
+                        chosen_tool_name = "error_json_decode_move"
+                    
+                    if chosen_tool_name == "move":
+                        direction = chosen_params.get("direction")
+                        if direction:
+                            print(f"LLM chose: move, Direction: {direction}")
+                            last_action_result = game.tool_move(direction)
+                        else:
+                            print(f"LLM chose 'move' but no direction provided. Args: {arguments_str}")
+                            last_action_result = game.tool_move("invalid_direction_due_to_missing_param")
+                            last_action_result["message"] = "LLM chose 'move' but did not specify a direction. Move failed."
+                    elif chosen_tool_name != "error_json_decode_move":
+                        print(f"LLM called unexpected tool for move: {chosen_tool_name}")
+                        last_action_result = game.tool_move("invalid_tool_call_for_move")
+                        last_action_result["message"] = f"LLM called an unexpected tool for move: {chosen_tool_name}. Move failed."
+
                     # Add LLM's tool call and game's response to history
-                    assistant_message_content = {"role": "assistant", "tool_calls": response.choices[0].message.tool_calls}
-                    if response.choices[0].message.content: # If LLM includes text along with tool call
-                        assistant_message_content["content"] = response.choices[0].message.content
-                    conversation_history.append(assistant_message_content)
+                    assistant_move_message = {"role": "assistant", "tool_calls": move_response.choices[0].message.tool_calls}
+                    if move_response.choices[0].message.content: # If LLM includes text
+                        assistant_move_message["content"] = move_response.choices[0].message.content
+                    conversation_history.append(assistant_move_message)
                     
                     conversation_history.append({
                         "role": "tool",
@@ -187,45 +226,46 @@ def play_maze_game(
                         "name": chosen_tool_name,
                         "content": json.dumps(last_action_result)
                     })
-                elif chosen_tool_name != "error_json_decode": # Some other tool was called?
-                    print(f"LLM called unexpected tool: {chosen_tool_name}")
-                    last_action_result = game.tool_move("invalid_tool_call") # Penalize turn
-                    last_action_result["message"] = f"LLM called an unexpected tool: {chosen_tool_name}. Move failed."
 
-            else: # No tool call
-                llm_text_response = response.choices[0].message.content if response.choices else "LLM did not choose a tool."
-                print(f"LLM response (no tool call): {llm_text_response}")
-                # Penalize turn, as no valid game action was taken
-                last_action_result = game.tool_move("no_tool_call_from_llm") 
-                last_action_result["message"] = f"LLM did not choose a tool. Response: '{llm_text_response}'. Move failed."
-                conversation_history.append({"role": "assistant", "content": llm_text_response})
+                else: # No tool call for move
+                    llm_text_response_move = move_response.choices[0].message.content if move_response.choices else "LLM did not choose a tool for move."
+                    print(f"LLM response (no tool call for move): {llm_text_response_move}")
+                    last_action_result = game.tool_move("no_tool_call_from_llm_for_move")
+                    last_action_result["message"] = f"LLM did not choose a tool for move. Response: '{llm_text_response_move}'. Move failed."
+                    conversation_history.append({"role": "assistant", "content": llm_text_response_move})
 
-        except litellm.RateLimitError as e:
-            print(f"Error: LiteLLM Rate Limit Error: {e}")
-            last_action_result = {"message": "Rate limit hit. Game cannot continue.", "error": "Rate limit"}
-            game.game_over = True # End game if API fails critically
-        except litellm.APIConnectionError as e:
-            print(f"Error: LiteLLM API Connection Error: {e}")
-            last_action_result = {"message": "API connection error. Game cannot continue.", "error": "API connection error"}
-            game.game_over = True
-        except Exception as e:
-            print(f"Error: An unexpected error occurred: {e}")
-            last_action_result = {"message": f"An unexpected error: {e}. Game cannot continue.", "error": "Unexpected error"}
-            game.game_over = True # End game on other critical errors
+            except litellm.RateLimitError as e:
+                print(f"Error: LiteLLM Rate Limit Error during move: {e}")
+                last_action_result = {"message": "Rate limit hit. Game cannot continue.", "error": "Rate limit"}
+                game.game_over = True 
+            except litellm.APIConnectionError as e:
+                print(f"Error: LiteLLM API Connection Error during move: {e}")
+                last_action_result = {"message": "API connection error. Game cannot continue.", "error": "API connection error"}
+                game.game_over = True
+            except Exception as e:
+                print(f"Error: An unexpected error occurred during move phase: {e}")
+                last_action_result = {"message": f"An unexpected error during move phase: {e}. Game cannot continue.", "error": "Unexpected error"}
+                game.game_over = True
 
         # Logging
         final_status_for_log = game.get_status()
         log_entry = {
-            **log_entry_pre_action,
-            "llm_full_response": llm_response_obj.model_dump_json() if llm_response_obj else None,
-            "chosen_tool": chosen_tool_name,
-            "tool_params": chosen_params,
+            "turn": current_status['turn_count'], # Turn number at the start of this iteration
+            "agent_position_before": current_status['agent_position'],
+            "score_before": current_status['score'],
+            "prompt_for_commentary": prompt_for_commentary,
+            "llm_commentary_response_obj": llm_commentary_response_obj.model_dump_json() if llm_commentary_response_obj else None,
+            "llm_commentary_text": llm_commentary,
+            "prompt_for_move": prompt_for_move if not commentary_error else "N/A (skipped due to commentary error)",
+            "llm_move_response_obj": llm_move_response_obj.model_dump_json() if llm_move_response_obj else None,
+            "chosen_tool_for_move": chosen_tool_name,
+            "tool_params_for_move": chosen_params,
             "action_result_message": last_action_result.get("message"),
             "action_result_full": last_action_result,
             "agent_position_after": final_status_for_log['agent_position'],
             "score_after": final_status_for_log['score'],
             "game_over_after": final_status_for_log['game_over'],
-            "turn_after_action": final_status_for_log['turn_count'] # Turn count from game state after action
+            "turn_after_action": final_status_for_log['turn_count'] 
         }
         with open(log_filename, "a") as f:
             f.write(json.dumps(log_entry) + "\n")
