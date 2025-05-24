@@ -274,7 +274,17 @@ Current tasks (first 3 for context only, do not modify directly):
             tool_choice="auto"
         )
 
+        if not response.choices or not response.choices[0].message:
+            logger.error("LLM response is missing choices or message object.")
+            return "Error: Received a malformed response from the LLM provider."
+
         message = response.choices[0].message
+
+        # Log raw message details
+        raw_message_content = message.content
+        raw_tool_calls = message.tool_calls
+        logger.info(f"LLM raw message content: '{raw_message_content}'")
+
         tool_calls = message.tool_calls
 
         if tool_calls:
@@ -299,19 +309,92 @@ Current tasks (first 3 for context only, do not modify directly):
                     logger.error(f"Unexpected error during execution of {function_name}: {e}", exc_info=True)
                     results.append({"error": f"Unexpected error in {function_name}: {str(e)}"})
             
-            # If multiple tool calls, results will be a list. If one, just the result.
-            # For simplicity, we'll just join their string representations if multiple.
-            if len(results) == 1:
-                 return f"Action result: {json.dumps(results[0])}"
-            return f"Action results: {json.dumps(results)}"
+            # Instead of returning results directly, pass them back to the LLM for a summary
+            
+            # Construct messages for the second LLM call
+            # user_input is the original text from the user.
+            # 'message' is response.choices[0].message from the first LLM call.
+            # It needs to be converted to a dictionary to be JSON serializable.
 
-        elif message.content: # Natural language response
+            assistant_message_dict = {"role": message.role} # message.role is typically "assistant"
+            
+            # Preserve content (None, empty string, or actual content)
+            # LiteLLM examples show "content": None for messages that primarily trigger tool calls.
+            assistant_message_dict["content"] = message.content 
+            
+            if message.tool_calls:
+                assistant_message_dict["tool_calls"] = [
+                    {
+                        "id": tc.id,
+                        "type": tc.type, # Usually "function"
+                        "function": {
+                            "name": tc.function.name,
+                            "arguments": tc.function.arguments # This is already a JSON string
+                        }
+                    } for tc in message.tool_calls
+                ]
+            
+            messages_for_summary_llm = [
+                {"role": "user", "content": user_input}, # The raw user input text
+                assistant_message_dict  # Use the converted dictionary
+            ]
+
+            # Append the results of the tool calls
+            # 'tool_calls' variable is already message.tool_calls from before this conversion
+            for i, tool_call_obj in enumerate(tool_calls): # tool_calls is message.tool_calls
+                # Ensure results[i] is a JSON string for the 'content' field
+                tool_result_content = json.dumps(results[i])
+                
+                messages_for_summary_llm.append({
+                    "role": "tool",
+                    "tool_call_id": tool_call_obj.id, 
+                    "name": tool_call_obj.function.name,
+                    "content": tool_result_content
+                })
+            
+            logger.info(f"Preparing for second LLM call. Messages: {json.dumps(messages_for_summary_llm, indent=2)}")
+
+            try:
+                # Second call to LLM to generate a natural language response based on tool execution
+                final_response_obj = litellm.completion(
+                    model=MAZKIR_LLM_MODEL,
+                    messages=messages_for_summary_llm
+                    # No tools or tool_choice needed here, we want a direct natural language response
+                )
+
+                if final_response_obj.choices and final_response_obj.choices[0].message and final_response_obj.choices[0].message.content:
+                    final_llm_output = final_response_obj.choices[0].message.content.strip()
+                    logger.info(f"LLM summary response after tool execution: '{final_llm_output}'")
+                    return final_llm_output
+                else:
+                    logger.error("LLM response after tool execution was empty or malformed.")
+                    # Fallback to returning raw tool results if summarization fails
+                    if len(results) == 1:
+                        return f"Action performed. Result: {json.dumps(results[0])} (LLM summary failed)"
+                    return f"Actions performed. Results: {json.dumps(results)} (LLM summary failed)"
+
+            except litellm.exceptions.APIError as e:
+                logger.error(f"LiteLLM APIError on second call (summarization): {e}", exc_info=True)
+                return f"Error: LLM API issue after tool execution: {e}. Raw results: {json.dumps(results)}"
+            except Exception as e:
+                logger.error(f"Unexpected error during second LLM call (summarization): {e}", exc_info=True)
+                # Fallback to returning raw tool results
+                if len(results) == 1:
+                    return f"Action performed. Result: {json.dumps(results[0])}. Error during summarization: {e}"
+                return f"Actions performed. Results: {json.dumps(results)}. Error during summarization: {e}"
+
+        elif message.content: # Natural language response from the first LLM call
             llm_output = message.content.strip()
-            logger.info("LLM output was natural language.")
-            return f"LLM response: {llm_output}"
-        else:
-            logger.warning("LLM response had neither tool_calls nor content.")
-            return "Assistant: I didn't receive a valid response from the model. Please try again."
+            if not llm_output: # Content was whitespace or effectively empty
+                logger.warning("LLM message.content was present but effectively empty after stripping.")
+                # Fall through to the 'else' block below
+            else:
+                logger.info("LLM output was natural language.")
+                return llm_output # Return direct output
+
+        # This block is reached if no tool_calls AND (message.content is None/empty OR message.content was only whitespace)
+        logger.warning("LLM response had no tool_calls and no meaningful content.")
+        return "I didn't receive a valid response from the model. Please try again." # Return direct message
 
     except litellm.exceptions.APIError as e: # More specific litellm error
         logger.error(f"LiteLLM APIError: {e}", exc_info=True)
