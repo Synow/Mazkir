@@ -5,38 +5,41 @@ import logging
 from datetime import datetime
 
 from dotenv import load_dotenv
-from openinference.instrumentation.litellm import LiteLLMInstrumentor
-from opentelemetry import trace
-from opentelemetry.sdk.trace import TracerProvider
-from opentelemetry.sdk.trace.export import BatchSpanProcessor
-from opentelemetry.exporter.otlp.proto.grpc.trace_exporter import OTLPSpanExporter
+# TODO: User request to remove Arize Phoenix integration for simplification.
+# from openinference.instrumentation.litellm import LiteLLMInstrumentor
+# from opentelemetry import trace
+# from opentelemetry.sdk.trace import TracerProvider
+# from opentelemetry.sdk.trace.export import BatchSpanProcessor
+# from opentelemetry.exporter.otlp.proto.grpc.trace_exporter import OTLPSpanExporter
 
+# Load environment variables from .env file
 load_dotenv()
 
-# Configure OpenTelemetry for Arize Phoenix
-# Ensure your Phoenix instance is running and accessible at the specified endpoint.
-# For local Docker setup, endpoint is typically http://localhost:4317 or http://0.0.0.0:4317
-phoenix_tracer_provider = trace.get_tracer_provider()
-if not isinstance(phoenix_tracer_provider, TracerProvider): # Check if a provider is already configured
-    phoenix_tracer_provider = TracerProvider()
-    trace.set_tracer_provider(phoenix_tracer_provider)
-else:
-    print("TracerProvider already configured.") # Or log this
-
-# Configure the OTLP exporter
-# Make sure your Phoenix collector is running at http://0.0.0.0:4317 (or your actual endpoint)
-otlp_exporter = OTLPSpanExporter(
-    endpoint="http://0.0.0.0:4317",  # Default for local Phoenix. Adjust if necessary.
-    insecure=True  # Use insecure=True for HTTP. For HTTPS, set to False and configure certs.
-)
-
-# Add the OTLP exporter to the tracer provider
-phoenix_tracer_provider.add_span_processor(BatchSpanProcessor(otlp_exporter))
-
-# Instrument LiteLLM
-LiteLLMInstrumentor().instrument(tracer_provider=phoenix_tracer_provider)
-
-print("Arize Phoenix LiteLLM Instrumentor configured.") # Add a print statement to confirm execution
+# TODO: User request to remove Arize Phoenix integration for simplification.
+# # Configure OpenTelemetry for Arize Phoenix
+# # Ensure your Phoenix instance is running and accessible at the specified endpoint.
+# # For local Docker setup, endpoint is typically http://localhost:4317 or http://0.0.0.0:4317
+# phoenix_tracer_provider = trace.get_tracer_provider()
+# if not isinstance(phoenix_tracer_provider, TracerProvider): # Check if a provider is already configured
+#     phoenix_tracer_provider = TracerProvider()
+#     trace.set_tracer_provider(phoenix_tracer_provider)
+# else:
+#     print("TracerProvider already configured.") # Or log this
+#
+# # Configure the OTLP exporter
+# # Make sure your Phoenix collector is running at http://0.0.0.0:4317 (or your actual endpoint)
+# otlp_exporter = OTLPSpanExporter(
+#     endpoint="http://0.0.0.0:4317",  # Default for local Phoenix. Adjust if necessary.
+#     insecure=True  # Use insecure=True for HTTP. For HTTPS, set to False and configure certs.
+# )
+#
+# # Add the OTLP exporter to the tracer provider
+# phoenix_tracer_provider.add_span_processor(BatchSpanProcessor(otlp_exporter))
+#
+# # Instrument LiteLLM
+# LiteLLMInstrumentor().instrument(tracer_provider=phoenix_tracer_provider)
+#
+# print("Arize Phoenix LiteLLM Instrumentor configured.") # Add a print statement to confirm execution
 
 # --- Configuration ---
 # Setup basic logging
@@ -52,6 +55,7 @@ logger = logging.getLogger(__name__)
 
 # Environment variable configuration
 MAZKIR_MEMORY_FILE = os.getenv("MAZKIR_MEMORY_FILE", "mazkir_users_memory.json") # Updated for multi-user
+# os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = "/Users/sivan/.config/gcloud/service-account-key.json" # Removed problematic hardcoded path
 MAZKIR_LLM_MODEL = os.getenv("MAZKIR_LLM_MODEL", "vertex_ai/gemini-2.5-flash-preview-04-17")
 os.environ["LITELLM_LOG"] = "INFO"
 
@@ -254,7 +258,7 @@ def perform_file_action(action_dict, user_data, user_id_for_save):
 
 # --- LLM Interaction ---
 # This function now requires user_id to load/save correct data and to pass for tool saving.
-def process_user_input(user_input: str, user_id: str):
+def process_user_input(user_id: str, user_input_text: str):
     """Processes user input using LLM and available tools for a specific user."""
     
     # Load the specific user's data
@@ -320,9 +324,9 @@ def process_user_input(user_input: str, user_id: str):
         }
     ]
 
-    prompt = f"""User input: "{user_input}"
+    prompt = f"""User input: "{user_input_text}"
 
-Based on the user input, decide if a tool should be used to manage tasks.
+Based on the user input, decide if a tool should be used to manage tasks (get tasks, add a task, or update task status).
 If a tool is appropriate, use it by calling the function. Otherwise, respond in natural language.
 
 Current tasks (first 3 for context only, do not modify directly):
@@ -345,9 +349,8 @@ Current tasks (first 3 for context only, do not modify directly):
 
         # Log raw message details
         raw_message_content = message.content
-        logger.info(f"-------------------")
+        raw_tool_calls = message.tool_calls
         logger.info(f"LLM raw message content: '{raw_message_content}'")
-        logger.info(f"-------------------")
 
         tool_calls = message.tool_calls
 
@@ -367,6 +370,13 @@ Current tasks (first 3 for context only, do not modify directly):
                     # Pass user_data and user_id for saving to perform_file_action
                     tool_result = perform_file_action(action_dict, user_data, user_id_for_save=user_id)
                     results.append(tool_result)
+                    # Note: perform_file_action (and the tools it calls like add_task, update_task_status)
+                    # are now responsible for saving the modified user_data using user_id.
+                    # If a tool that doesn't modify data (like get_tasks) was called, user_data remains unchanged here.
+                    # If a tool modified user_data, it should have been saved to file already.
+                    # We might need to reload user_data if the tool modified it and we want the absolute latest state
+                    # for the second LLM call's context, but tools return the result of their action,
+                    # which is usually sufficient for the summarization.
                 except ToolExecutionError as e:
                     logger.error(f"ToolExecutionError for action {function_name} for user {user_id}: {e}", exc_info=True)
                     results.append({"error": f"Error executing {function_name}: {str(e)}"})
@@ -381,7 +391,7 @@ Current tasks (first 3 for context only, do not modify directly):
             # Pass them back to the LLM for a summary
             
             # Construct messages for the second LLM call
-            # user_input is the original text from the user.
+            # user_input_text is the original text from the user.
             # 'message' is response.choices[0].message from the first LLM call.
             # It needs to be converted to a dictionary to be JSON serializable.
 
@@ -404,7 +414,7 @@ Current tasks (first 3 for context only, do not modify directly):
                 ]
             
             messages_for_summary_llm = [
-                {"role": "user", "content": user_input}, # The raw user input text
+                {"role": "user", "content": user_input_text}, # The raw user input text
                 assistant_message_dict  # Use the converted dictionary
             ]
 

@@ -6,15 +6,15 @@ class BaseHandler(ABC):
     Abstract base class for user interaction handlers.
     """
 
-    def __init__(self, process_user_input_func: Callable[[str, str], str]):
+    def __init__(self, process_user_input_func: Callable[[str, str], str]): # Order: user_id, user_input_text
         """
         Initializes the handler.
 
         Args:
-            process_user_input_func: A callable that takes a user input string
-                                     and a user_id string, and returns the assistant's
-                                     response string. This is typically the 
-                                     `process_user_input` function from mazkir.py.
+            process_user_input_func: A callable that takes a user_id string (first)
+                                     and a user_input_text string (second), and 
+                                     returns the assistant's response string. 
+                                     This is typically the `process_user_input` function from mazkir.py.
         """
         self.process_user_input_func = process_user_input_func
 

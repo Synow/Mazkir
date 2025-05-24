@@ -113,7 +113,8 @@ class CliHandler(BaseHandler):
                     continue
 
                 # Call the core processing function passed during initialization
-                assistant_response = self.process_user_input_func(user_input_text, user_id)
+                # Signature changed to: process_user_input_func(user_id, user_input_text)
+                assistant_response = self.process_user_input_func(user_id, user_input_text)
                 # Use the send_message method (even though it's simple for CLI)
                 # In a truly async application, one might `asyncio.run(self.send_message(...))` or handle it differently.
                 # For this synchronous start() loop, direct print or a synchronous wrapper is okay.
@@ -154,7 +155,8 @@ if __name__ == '__main__':
     except ImportError:
         logger.critical("Failed to import components from mazkir.py. Ensure it is in PYTHONPATH.")
         # Define mock_process_user_input for the handler to be instantiated for basic testing
-        def process_user_input(user_input: str, user_id: str) -> str: # type: ignore
+        # Note: Signature updated to user_id, user_input_text
+        def process_user_input(user_id: str, user_input_text: str) -> str: # type: ignore
             logger.error("Using MOCK process_user_input due to import error from mazkir.py")
             return "Error: Mazkir core function not loaded."
         # Define MAZKIR_MEMORY_FILE and MAZKIR_LLM_MODEL if not imported
