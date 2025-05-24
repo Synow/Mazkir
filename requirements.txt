@@ -1,0 +1,8 @@
+litellm
+python-dotenv
+openinference-instrumentation-litellm
+opentelemetry-sdk
+opentelemetry-exporter-otlp-proto-grpc
+google-cloud-aiplatform
+google-auth
+openai

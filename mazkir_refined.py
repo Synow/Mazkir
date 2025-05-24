@@ -4,6 +4,41 @@ import litellm
 import logging
 from datetime import datetime
 
+from dotenv import load_dotenv
+from openinference.instrumentation.litellm import LiteLLMInstrumentor
+from opentelemetry import trace
+from opentelemetry.sdk.trace import TracerProvider
+from opentelemetry.sdk.trace.export import BatchSpanProcessor
+from opentelemetry.exporter.otlp.proto.grpc.trace_exporter import OTLPSpanExporter
+
+# Load environment variables from .env file
+load_dotenv()
+
+# Configure OpenTelemetry for Arize Phoenix
+# Ensure your Phoenix instance is running and accessible at the specified endpoint.
+# For local Docker setup, endpoint is typically http://localhost:4317 or http://0.0.0.0:4317
+phoenix_tracer_provider = trace.get_tracer_provider()
+if not isinstance(phoenix_tracer_provider, TracerProvider): # Check if a provider is already configured
+    phoenix_tracer_provider = TracerProvider()
+    trace.set_tracer_provider(phoenix_tracer_provider)
+else:
+    print("TracerProvider already configured.") # Or log this
+
+# Configure the OTLP exporter
+# Make sure your Phoenix collector is running at http://0.0.0.0:4317 (or your actual endpoint)
+otlp_exporter = OTLPSpanExporter(
+    endpoint="http://0.0.0.0:4317",  # Default for local Phoenix. Adjust if necessary.
+    insecure=True  # Use insecure=True for HTTP. For HTTPS, set to False and configure certs.
+)
+
+# Add the OTLP exporter to the tracer provider
+phoenix_tracer_provider.add_span_processor(BatchSpanProcessor(otlp_exporter))
+
+# Instrument LiteLLM
+LiteLLMInstrumentor().instrument(tracer_provider=phoenix_tracer_provider)
+
+print("Arize Phoenix LiteLLM Instrumentor configured.") # Add a print statement to confirm execution
+
 # --- Configuration ---
 # Setup basic logging
 logging.basicConfig(
@@ -18,7 +53,7 @@ logger = logging.getLogger(__name__)
 
 # Environment variable configuration
 MAZKIR_MEMORY_FILE = os.getenv("MAZKIR_MEMORY_FILE", "mazkir_memory.json")
-os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = "/Users/sivan/.config/gcloud/service-account-key.json"
+# os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = "/Users/sivan/.config/gcloud/service-account-key.json" # Removed problematic hardcoded path
 MAZKIR_LLM_MODEL = os.getenv("MAZKIR_LLM_MODEL", "vertex_ai/gemini-2.5-flash-preview-04-17")
 os.environ["LITELLM_LOG"] = "INFO"
 
@@ -164,50 +199,127 @@ def perform_file_action(action_dict, memory_data):
 
 # --- LLM Interaction ---
 def process_user_input(user_input, memory_data):
-    """Processes user input using LLM and available tools."""
+    """Processes user input using LLM and available tools with native tool calling."""
+
+    tools_list = [
+        {
+            "type": "function",
+            "function": {
+                "name": "get_tasks",
+                "description": "Get all tasks.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {}
+                }
+            }
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "add_task",
+                "description": "Add a new task.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "description": {
+                            "type": "string",
+                            "description": "The description of the task."
+                        },
+                        "due_date": {
+                            "type": "string",
+                            "description": "The due date of the task (e.g., YYYY-MM-DD). Optional."
+                        }
+                    },
+                    "required": ["description"]
+                }
+            }
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "update_task_status",
+                "description": "Update a task's status.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "task_id": {
+                            "type": "integer",
+                            "description": "The ID of the task to update."
+                        },
+                        "status": {
+                            "type": "string",
+                            "description": "The new status of the task (e.g., pending, completed, deferred)."
+                        }
+                    },
+                    "required": ["task_id", "status"]
+                }
+            }
+        }
+    ]
 
     prompt = f"""User input: "{user_input}"
-Available tools:
-1. get_tasks: Get all tasks. (JSON: {{"action": "get_tasks"}})
-2. add_task: Add a new task. (JSON: {{"action": "add_task", "params": {{"description": "task description", "due_date": "YYYY-MM-DD" (optional)}}}})
-3. update_task_status: Update a task's status. (JSON: {{"action": "update_task_status", "params": {{"task_id": 123, "status": "completed|pending|deferred"}}}})
 
-Based on the user input, decide if a tool should be used.
-If yes, respond with a JSON object describing the action and its parameters.
-If no tool is needed, or if you need clarification, respond with a natural language message.
-Example action JSON: {{"action": "add_task", "params": {{"description": "Buy groceries"}}}}
+Based on the user input, decide if a tool should be used to manage tasks (get tasks, add a task, or update task status).
+If a tool is appropriate, use it by calling the function. Otherwise, respond in natural language.
 
 Current tasks (first 3 for context only, do not modify directly):
-{json.dumps(memory_data.get('tasks', [])[:3], indent=2)} 
-
-Respond with ONLY the JSON action or a natural language message."""
+{json.dumps(memory_data.get('tasks', [])[:3], indent=2)}
+"""
 
     try:
         response = litellm.completion(
             model=MAZKIR_LLM_MODEL,
-            messages=[{"content": prompt, "role": "user"}]
+            messages=[{"content": prompt, "role": "user"}],
+            tools=tools_list,
+            tool_choice="auto"
         )
-        llm_output = response.choices[0].message.content.strip()
-    except Exception as e:
-        logger.error(f"Unexpected error calling LiteLLM: {e}", exc_info=True)
-        return f"Error: Could not get response from LLM: {e}"
-    try:
-        action_dict = json.loads(llm_output)
-        if "action" in action_dict:
-            tool_result = perform_file_action(action_dict, memory_data)
-            return f"Action result: {json.dumps(tool_result)}"
+
+        message = response.choices[0].message
+        tool_calls = message.tool_calls
+
+        if tool_calls:
+            results = []
+            for tool_call in tool_calls:
+                function_name = tool_call.function.name
+                try:
+                    function_args = json.loads(tool_call.function.arguments)
+                except json.JSONDecodeError as e:
+                    logger.error(f"Error decoding JSON arguments for tool {function_name}: {tool_call.function.arguments}. Error: {e}", exc_info=True)
+                    results.append({"error": f"Invalid arguments for {function_name}: {e}"})
+                    continue
+
+                action_dict = {"action": function_name, "params": function_args}
+                try:
+                    tool_result = perform_file_action(action_dict, memory_data)
+                    results.append(tool_result)
+                except ToolExecutionError as e:
+                    logger.error(f"ToolExecutionError for action {function_name}: {e}", exc_info=True)
+                    results.append({"error": f"Error executing {function_name}: {str(e)}"})
+                except Exception as e: # Catch unexpected errors from perform_file_action
+                    logger.error(f"Unexpected error during execution of {function_name}: {e}", exc_info=True)
+                    results.append({"error": f"Unexpected error in {function_name}: {str(e)}"})
+            
+            # If multiple tool calls, results will be a list. If one, just the result.
+            # For simplicity, we'll just join their string representations if multiple.
+            if len(results) == 1:
+                 return f"Action result: {json.dumps(results[0])}"
+            return f"Action results: {json.dumps(results)}"
+
+        elif message.content: # Natural language response
+            llm_output = message.content.strip()
+            logger.info("LLM output was natural language.")
+            return f"LLM response: {llm_output}"
         else:
-            logger.info("LLM output was JSON but not an action, treating as natural language.")
-            return f"LLM response: {llm_output}" # Valid JSON, but not an action dict
-    except json.JSONDecodeError:
-        logger.info("LLM output was not JSON, treating as natural language response.")
-        return f"LLM response: {llm_output}" # Not JSON
-    except ToolExecutionError as e: # Catch errors from perform_file_action if it raises them directly
-        logger.error(f"Error during tool execution triggered by LLM: {e}", exc_info=True)
-        return f"Error executing requested action: {e}"
-    except Exception as e:
-        logger.error(f"Error processing LLM response or executing action: {e}", exc_info=True)
-        return f"Error processing LLM response: {e}"
+            logger.warning("LLM response had neither tool_calls nor content.")
+            return "Assistant: I didn't receive a valid response from the model. Please try again."
+
+    except litellm.exceptions.APIError as e: # More specific litellm error
+        logger.error(f"LiteLLM APIError: {e}", exc_info=True)
+        return f"Error: LLM API issue: {e}"
+    except Exception as e: # General errors during litellm.completion or response processing
+        logger.error(f"Unexpected error processing user input: {e}", exc_info=True)
+        return f"Error: Could not get response from LLM or process it: {e}"
+
 
 # --- Main Interactive Loop ---
 def run_interactive_mode():
