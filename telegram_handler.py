@@ -146,7 +146,7 @@ if __name__ == '__main__':
     except ImportError:
         logger.critical("Failed to import 'process_user_input' from mazkir.py for __main__ test. Ensure it is in PYTHONPATH.")
         # Define a mock for the handler to be instantiated if import fails
-        def process_user_input(user_input: str, user_id: str) -> str: # type: ignore 
+        def process_user_input(user_id: str, user_input_text: str) -> str: # type: ignore 
             logger.error("Using MOCK process_user_input due to import error from mazkir.py for TelegramHandler test")
             return "Error: Mazkir core function not loaded for Telegram."
 

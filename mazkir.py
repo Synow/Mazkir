@@ -254,7 +254,7 @@ def perform_file_action(action_dict, user_data, user_id_for_save):
 
 # --- LLM Interaction ---
 # This function now requires user_id to load/save correct data and to pass for tool saving.
-def process_user_input(user_input: str, user_id: str):
+def process_user_input(user_id: str, user_input_text: str):
     """Processes user input using LLM and available tools for a specific user."""
     
     # Load the specific user's data
@@ -320,7 +320,7 @@ def process_user_input(user_input: str, user_id: str):
         }
     ]
 
-    prompt = f"""User input: "{user_input}"
+    prompt = f"""User input: "{user_input_text}"
 
 Based on the user input, decide if a tool should be used to manage tasks.
 If a tool is appropriate, use it by calling the function. Otherwise, respond in natural language.
@@ -404,7 +404,7 @@ Current tasks (first 3 for context only, do not modify directly):
                 ]
             
             messages_for_summary_llm = [
-                {"role": "user", "content": user_input}, # The raw user input text
+                {"role": "user", "content": user_input_text}, # The raw user input text
                 assistant_message_dict  # Use the converted dictionary
             ]
 
@@ -421,7 +421,6 @@ Current tasks (first 3 for context only, do not modify directly):
                     "content": tool_result_content
                 })
             
-            logger.info(f"Preparing for second LLM call. Messages: {json.dumps(messages_for_summary_llm, indent=2)}")
 
             try:
                 # Second call to LLM to generate a natural language response based on tool execution
