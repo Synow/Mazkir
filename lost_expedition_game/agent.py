@@ -3,11 +3,46 @@
 import json
 import litellm
 import os # For potential API key management
+from dotenv import load_dotenv
+load_dotenv()
 
 from .game import LostExpeditionGame
 from .config import LLM_TOOLS, DEFAULT_LLM_MODEL
 from .items import CRAFTABLE_ITEMS, USABLE_ITEMS # For prompt context
-from .config import DEFAULT_LLM_MODEL # Make sure this is imported if used as default in runner
+
+from openinference.instrumentation.litellm import LiteLLMInstrumentor
+from opentelemetry import trace
+from opentelemetry.sdk.trace import TracerProvider
+from opentelemetry.sdk.trace.export import BatchSpanProcessor
+from opentelemetry.exporter.otlp.proto.grpc.trace_exporter import OTLPSpanExporter
+
+load_dotenv()
+
+# Configure OpenTelemetry for Arize Phoenix
+# Ensure your Phoenix instance is running and accessible at the specified endpoint.
+# For local Docker setup, endpoint is typically http://localhost:4317 or http://0.0.0.0:4317
+phoenix_tracer_provider = trace.get_tracer_provider()
+if not isinstance(phoenix_tracer_provider, TracerProvider): # Check if a provider is already configured
+    phoenix_tracer_provider = TracerProvider()
+    trace.set_tracer_provider(phoenix_tracer_provider)
+else:
+    print("TracerProvider already configured.") # Or log this
+
+# Configure the OTLP exporter
+# Make sure your Phoenix collector is running at http://0.0.0.0:4317 (or your actual endpoint)
+otlp_exporter = OTLPSpanExporter(
+    endpoint="http://0.0.0.0:4317",  # Default for local Phoenix. Adjust if necessary.
+    insecure=True  # Use insecure=True for HTTP. For HTTPS, set to False and configure certs.
+)
+
+# Add the OTLP exporter to the tracer provider
+phoenix_tracer_provider.add_span_processor(BatchSpanProcessor(otlp_exporter))
+
+# Instrument LiteLLM
+LiteLLMInstrumentor().instrument(tracer_provider=phoenix_tracer_provider)
+
+print("Arize Phoenix LiteLLM Instrumentor configured.") # Add a print statement to confirm execution
+
 
 # Set API key if necessary (example for OpenAI, adapt as needed for other providers)
 # litellm.api_key = os.environ.get("OPENAI_API_KEY")

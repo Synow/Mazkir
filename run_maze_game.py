@@ -1,4 +1,48 @@
 """Main script to run the Simple Maze Game."""
+"""LLM Agent logic for the Lost Expedition game."""
+
+import json
+import litellm
+import os # For potential API key management
+from dotenv import load_dotenv
+load_dotenv()
+
+DEFAULT_LLM_MODEL="vertex_ai/gemini-2.5-flash-preview-04-17"
+
+from openinference.instrumentation.litellm import LiteLLMInstrumentor
+from opentelemetry import trace
+from opentelemetry.sdk.trace import TracerProvider
+from opentelemetry.sdk.trace.export import BatchSpanProcessor
+from opentelemetry.exporter.otlp.proto.grpc.trace_exporter import OTLPSpanExporter
+
+load_dotenv()
+
+# Configure OpenTelemetry for Arize Phoenix
+# Ensure your Phoenix instance is running and accessible at the specified endpoint.
+# For local Docker setup, endpoint is typically http://localhost:4317 or http://0.0.0.0:4317
+phoenix_tracer_provider = trace.get_tracer_provider()
+if not isinstance(phoenix_tracer_provider, TracerProvider): # Check if a provider is already configured
+    phoenix_tracer_provider = TracerProvider()
+    trace.set_tracer_provider(phoenix_tracer_provider)
+else:
+    print("TracerProvider already configured.") # Or log this
+
+# Configure the OTLP exporter
+# Make sure your Phoenix collector is running at http://0.0.0.0:4317 (or your actual endpoint)
+otlp_exporter = OTLPSpanExporter(
+    endpoint="http://0.0.0.0:4317",  # Default for local Phoenix. Adjust if necessary.
+    insecure=True  # Use insecure=True for HTTP. For HTTPS, set to False and configure certs.
+)
+
+# Add the OTLP exporter to the tracer provider
+phoenix_tracer_provider.add_span_processor(BatchSpanProcessor(otlp_exporter))
+
+# Instrument LiteLLM
+LiteLLMInstrumentor().instrument(tracer_provider=phoenix_tracer_provider)
+
+print("Arize Phoenix LiteLLM Instrumentor configured.") # Add a print statement to confirm execution
+
+
 
 import argparse
 import json

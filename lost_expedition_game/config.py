@@ -1,6 +1,7 @@
 """Game configuration settings."""
 
 DEFAULT_LLM_MODEL = "gpt-3.5-turbo" # Example, ensure this is accessible via litellm
+DEFAULT_LLM_MODEL = "vertex_ai/gemini-2.5-flash-preview-04-17"  # Or any other preferred default model
 
 LLM_TOOLS = [
     {

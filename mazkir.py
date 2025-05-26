@@ -347,17 +347,7 @@ Current tasks (first 3 for context only, do not modify directly):
             tool_choice="auto"
         )
 
-        if not response.choices or not response.choices[0].message:
-            logger.error("LLM response is missing choices or message object.")
-            return "Error: Received a malformed response from the LLM provider."
-
         message = response.choices[0].message
-
-        # Log raw message details
-        raw_message_content = message.content
-        logger.info(f"-------------------")
-        logger.info(f"LLM raw message content: '{raw_message_content}'")
-        logger.info(f"-------------------")
 
         tool_calls = message.tool_calls
 
@@ -373,32 +363,12 @@ Current tasks (first 3 for context only, do not modify directly):
                     continue
 
                 action_dict = {"action": function_name, "params": function_args}
-                try:
-                    # Pass user_data and user_id for saving to perform_file_action
-                    tool_result = perform_file_action(action_dict, user_data, user_id_for_save=user_id)
-                    results.append(tool_result)
-                except ToolExecutionError as e:
-                    logger.error(f"ToolExecutionError for action {function_name} for user {user_id}: {e}", exc_info=True)
-                    results.append({"error": f"Error executing {function_name}: {str(e)}"})
-                except Exception as e: 
-                    logger.error(f"Unexpected error during execution of {function_name} for user {user_id}: {e}", exc_info=True)
-                    results.append({"error": f"Unexpected error in {function_name}: {str(e)}"})
+                # Pass user_data and user_id for saving to perform_file_action
+                tool_result = perform_file_action(action_dict, user_data, user_id_for_save=user_id)
+                results.append(tool_result)
             
-            # After tool execution, user_data in memory *might* have been changed by the tool.
-            # The save_memory call *within* the tool (add_task, update_task_status) should persist this.
-            # The 'results' list contains what the tools returned.
-            
-            # Pass them back to the LLM for a summary
-            
-            # Construct messages for the second LLM call
-            # user_input is the original text from the user.
-            # 'message' is response.choices[0].message from the first LLM call.
-            # It needs to be converted to a dictionary to be JSON serializable.
 
             assistant_message_dict = {"role": message.role} # message.role is typically "assistant"
-            
-            # Preserve content (None, empty string, or actual content)
-            # LiteLLM examples show "content": None for messages that primarily trigger tool calls.
             assistant_message_dict["content"] = message.content 
             
             if message.tool_calls:
