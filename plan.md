@@ -1,3 +1,5 @@
+**Note: The core task management, archiving, and reminder features described in this plan have been implemented in `mazkir.py` as of [current date/version, placeholder for actual date]. This document reflects the initial design and considerations. For the latest implementation details, please refer to the `mazkir.py` script and its associated tests.**
+
 ## Overview of the Mazkir System
 
 Mazkir is a local personal assistant that uses a Large Language Model (LLM) to help manage and organize tasks. It is designed as an LLM-based agent that can **reason, plan, and use tools (in this case, a local memory file)** to keep track of tasks and user preferences. This aligns with the emerging trend of AI assistants becoming proactive, context-aware agents that combine LLM capabilities with reasoning, planning, tool calls, and memory. The core components of Mazkir include:
