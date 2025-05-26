@@ -295,10 +295,13 @@ def check_due_reminders(user_data):
                             # If reminder_time_obj is offset-aware, make current_time offset-aware for comparison or vice-versa.
                             # For simplicity, if reminder_time_obj has tzinfo, we'll convert current_time to that timezone.
                             # This is a basic approach; a more robust solution uses UTC everywhere.
-                            if reminder_time_obj.tzinfo:
-                                current_time_for_comparison = current_time.astimezone(reminder_time_obj.tzinfo)
-                            else:
-                                # If reminder_time_obj is naive, current_time is also naive.
+                            if reminder_time_obj.tzinfo: # Reminder is timezone-aware
+                                # Make current_time (which is naive local) timezone-aware of the system's local timezone
+                                local_tz = datetime.now().astimezone().tzinfo 
+                                current_time_aware_local = current_time.replace(tzinfo=local_tz)
+                                # Now convert the aware local current time to the reminder's timezone for comparison
+                                current_time_for_comparison = current_time_aware_local.astimezone(reminder_time_obj.tzinfo)
+                            else: # Reminder is naive, current_time is also naive. Direct comparison.
                                 current_time_for_comparison = current_time
 
                             if current_time_for_comparison >= reminder_time_obj:
@@ -335,12 +338,17 @@ def check_due_reminders(user_data):
                         
                         # Calculate next reminder time
                         # from datetime import timedelta (ensure timedelta is imported if not already)
-                        from datetime import timedelta # Added here for safety, though usually at top
+                        from datetime import timedelta, timezone # Ensure timezone is imported for UTC operations
                         next_reminder_time = last_reminded_at_obj + timedelta(hours=float(interval_hours))
 
-                        current_time_for_comparison = current_time
-                        if last_reminded_at_obj.tzinfo: # If last_reminded was tz-aware
-                             current_time_for_comparison = current_time.astimezone(last_reminded_at_obj.tzinfo)
+                        current_time_for_comparison = current_time # Default to naive current_time
+                        if last_reminded_at_obj.tzinfo: # If last_reminded_at was timezone-aware
+                            # Make current_time (naive local) timezone-aware of the system's local timezone
+                            local_tz = datetime.now().astimezone().tzinfo
+                            current_time_aware_local = current_time.replace(tzinfo=local_tz)
+                            # Convert current time to the timezone of last_reminded_at_obj for comparison
+                            current_time_for_comparison = current_time_aware_local.astimezone(last_reminded_at_obj.tzinfo)
+                        # If last_reminded_at_obj is naive, current_time_for_comparison remains naive current_time.
                         
                         if current_time_for_comparison >= next_reminder_time:
                             due_reminders_messages.append(
@@ -761,35 +769,28 @@ Respond now.
             # 'message' is response.choices[0].message from the first LLM call.
             # It needs to be converted to a dictionary to be JSON serializable.
 
-            assistant_message_dict = {"role": message.role} # message.role is typically "assistant"
-            
-            # Preserve content (None, empty string, or actual content)
-            # LiteLLM examples show "content": None for messages that primarily trigger tool calls.
+            assistant_message_dict = {"role": message.role} 
             assistant_message_dict["content"] = message.content 
-            
             if message.tool_calls:
                 assistant_message_dict["tool_calls"] = [
                     {
                         "id": tc.id,
-                        "type": tc.type, # Usually "function"
+                        "type": tc.type, 
                         "function": {
                             "name": tc.function.name,
-                            "arguments": tc.function.arguments # This is already a JSON string
+                            "arguments": tc.function.arguments 
                         }
                     } for tc in message.tool_calls
                 ]
             
             messages_for_summary_llm = [
-                {"role": "user", "content": user_input_text}, # The raw user input text
-                assistant_message_dict  # Use the converted dictionary
+                {"role": "user", "content": user_input_text}, 
+                assistant_message_dict 
             ]
 
-            # Append the results of the tool calls
-            # 'tool_calls' variable is already message.tool_calls from before this conversion
-            for i, tool_call_obj in enumerate(tool_calls): # tool_calls is message.tool_calls
-                # Ensure results[i] is a JSON string for the 'content' field
+            for i, tool_call_obj in enumerate(tool_calls): 
                 tool_result_content = json.dumps(results[i])
-                
+                # Optional: Truncate long tool_result_content if it's from get_tasks and very long. Skipped for now.
                 messages_for_summary_llm.append({
                     "role": "tool",
                     "tool_call_id": tool_call_obj.id, 
@@ -797,105 +798,117 @@ Respond now.
                     "content": tool_result_content
                 })
             
+            # Enhanced Logging: Log messages for summarization call
+            logger.debug(f"Messages for summarization LLM: {json.dumps(messages_for_summary_llm, indent=2)}")
 
             try:
-                # Second call to LLM to generate a natural language response based on tool execution
                 final_response_obj = litellm.completion(
                     model=MAZKIR_LLM_MODEL,
                     messages=messages_for_summary_llm
-                    # No tools or tool_choice needed here, we want a direct natural language response
                 )
 
                 if final_response_obj.choices and final_response_obj.choices[0].message and final_response_obj.choices[0].message.content:
                     final_llm_output = final_response_obj.choices[0].message.content.strip()
                     logger.info(f"LLM summary response after tool execution: '{final_llm_output}'")
-                    return final_llm_output
+                    # Enhanced Logging: Log finish_reason
+                    logger.info(f"LLM summary finish reason: {final_response_obj.choices[0].get('finish_reason', 'N/A')}")
                 else:
-                    logger.error("LLM response after tool execution was empty or malformed.")
-                    # Fallback to returning raw tool results if summarization fails
+                    # Enhanced Logging: Log more details on failure
+                    finish_reason = "N/A"
+                    if final_response_obj.choices and final_response_obj.choices[0]: # Check if choices[0] exists
+                        finish_reason = final_response_obj.choices[0].get('finish_reason', 'N/A')
+                    logger.error(f"LLM response after tool execution was empty or malformed. Finish reason: {finish_reason}. Raw response object: {final_response_obj!r}") # Use !r for more detailed object logging
+                    
                     if len(results) == 1:
-                        return f"Action performed. Result: {json.dumps(results[0])} (LLM summary failed)"
-                    return f"Actions performed. Results: {json.dumps(results)} (LLM summary failed)"
-
+                        final_llm_output = f"Action performed. Result: {json.dumps(results[0])} (LLM summary failed)"
+                    else:
+                        final_llm_output = f"Actions performed. Results: {json.dumps(results)} (LLM summary failed)"
+                final_response_str = final_llm_output # Initialize final_response_str with the LLM's output (or fallback message)
             except litellm.exceptions.APIError as e:
                 logger.error(f"LiteLLM APIError on second call (summarization): {e}", exc_info=True)
-                return f"Error: LLM API issue after tool execution: {e}. Raw results: {json.dumps(results)}"
+                final_response_str = f"Error: LLM API issue after tool execution: {e}. Raw results: {json.dumps(results)}"
             except Exception as e:
                 logger.error(f"Unexpected error during second LLM call (summarization): {e}", exc_info=True)
-                # Fallback to returning raw tool results
                 if len(results) == 1:
-                    return f"Action performed. Result: {json.dumps(results[0])}. Error during summarization: {e}"
-                return f"Actions performed. Results: {json.dumps(results)}. Error during summarization: {e}"
+                    final_response_str = f"Action performed. Result: {json.dumps(results[0])}. Error during summarization: {e}"
+                else:
+                    final_response_str = f"Actions performed. Results: {json.dumps(results)}. Error during summarization: {e}"
 
         elif message.content: # Natural language response from the first LLM call
             llm_output = message.content.strip()
             if not llm_output: # Content was whitespace or effectively empty
                 logger.warning("LLM message.content was present but effectively empty after stripping.")
-                final_response_str = "I didn't have a specific action to take, but I've checked your reminders."
+                final_response_str = "" # Initialize as empty to let reminders be primary if LLM is silent
             else:
                 logger.info("LLM output was natural language.")
                 final_response_str = llm_output
-        else: # No tool_calls and no message.content
-            logger.warning("LLM response had no tool_calls and no meaningful content. Defaulting reminder check message.")
-            final_response_str = "I've checked your reminders." # Default response when LLM gives no specific instruction but we proceed to check reminders
+        else: # No tool_calls and no message.content (LLM returned nothing useful)
+            logger.warning("LLM response had no tool_calls and no meaningful content.")
+            final_response_str = "" # Initialize as empty
 
         # --- Reminder Checking ---
-        # This happens after LLM response/tool execution and potential summarization
         user_data_modified_by_reminders = False
         try:
-            due_reminder_messages = check_due_reminders(user_data)
+            due_reminder_messages = check_due_reminders(user_data) # Modifies user_data in-place
+            
             if due_reminder_messages:
-                user_data_modified_by_reminders = True # Mark that user_data was changed
+                user_data_modified_by_reminders = True 
                 reminder_report = "\n\n--- Upcoming Reminders ---\n" + "\n".join(due_reminder_messages)
-                final_response_str += reminder_report
+                if final_response_str:
+                    final_response_str += reminder_report
+                else:
+                    final_response_str = reminder_report.lstrip() 
                 logger.info(f"Due reminders found for user {user_id}: {due_reminder_messages}")
-            else:
-                # Optionally, add a message if no reminders are due, if final_response_str is minimal
-                if final_response_str == "I've checked your reminders.": # Only if no other LLM output
-                     final_response_str += "\nNo reminders are currently due."
+            else: # No due reminders
                 logger.info(f"No due reminders for user {user_id}.")
+                if not final_response_str: # LLM was also silent
+                    final_response_str = "No tasks or reminders are currently due."
 
         except Exception as e:
             logger.error(f"Error during check_due_reminders for user {user_id}: {e}", exc_info=True)
-            final_response_str += "\nError: Could not check reminders due to an internal issue."
-            # Do not set user_data_modified_by_reminders to True here, as the check failed.
+            reminder_error_msg = "\nError: Could not check reminders due to an internal issue."
+            if final_response_str:
+                final_response_str += reminder_error_msg
+            else:
+                final_response_str = reminder_error_msg.lstrip()
+            # user_data_modified_by_reminders remains False
 
         # --- Save memory if check_due_reminders modified it ---
-        # This is crucial because check_due_reminders modifies user_data in-place (e.g. specific_time_triggered, last_reminded_at)
-        # and these changes need to be saved even if no tools that explicitly save memory were called.
         if user_data_modified_by_reminders:
             try:
-                save_memory(user_id, user_data) # MAZKIR_MEMORY_FILE is used by default
+                save_memory(user_id, user_data) 
                 logger.info(f"Memory saved for user {user_id} after reminder check modified user_data.")
             except MemoryOperationError as e:
                 logger.error(f"Failed to save memory for user {user_id} after reminder check: {e}", exc_info=True)
-                # Append to response or handle as critical error?
-                final_response_str += "\nWarning: Could not save updated reminder status."
+                save_warning_msg = "\nWarning: Could not save updated reminder status."
+                if final_response_str: # Append warning to existing response
+                    final_response_str += save_warning_msg
+                else: # Or set as primary if no other response (should be rare)
+                    final_response_str = save_warning_msg.lstrip()
         
         return final_response_str
 
     except litellm.exceptions.APIError as e: # More specific litellm error
         logger.error(f"LiteLLM APIError in process_user_input for user {user_id}: {e}", exc_info=True)
-        # Attempt to check reminders even if LLM fails, as a fallback
-        final_response_str = f"Error: LLM API issue: {e}."
-        user_data_modified_by_reminders = False
+        final_response_str = f"Error: LLM API issue: {e}." # Primary error message
+        user_data_modified_by_reminders = False 
         try:
             due_reminder_messages = check_due_reminders(user_data)
             if due_reminder_messages:
                 user_data_modified_by_reminders = True
                 reminder_report = "\n\n--- Upcoming Reminders ---\n" + "\n".join(due_reminder_messages)
-                final_response_str += reminder_report
+                final_response_str += reminder_report 
+            # If no reminders in fallback, we don't add "no reminders due" to an error message.
             if user_data_modified_by_reminders:
                  save_memory(user_id, user_data)
-        except Exception as re: # Reminder Exception
+        except Exception as re: 
             logger.error(f"Error during fallback reminder check for user {user_id}: {re}", exc_info=True)
-            final_response_str += "\nAdditionally, could not check reminders."
+            final_response_str += "\nAdditionally, could not check reminders due to an internal issue."
         return final_response_str
 
     except Exception as e: # General errors during litellm.completion or response processing
         logger.error(f"Unexpected error in process_user_input for user {user_id}: {e}", exc_info=True)
-        # Attempt to check reminders even if other processing fails
-        final_response_str = f"Error: Could not fully process your request: {e}."
+        final_response_str = f"Error: Could not fully process your request: {e}." # Primary error message
         user_data_modified_by_reminders = False
         try:
             due_reminder_messages = check_due_reminders(user_data)
@@ -903,11 +916,12 @@ Respond now.
                 user_data_modified_by_reminders = True
                 reminder_report = "\n\n--- Upcoming Reminders ---\n" + "\n".join(due_reminder_messages)
                 final_response_str += reminder_report
+            # If no reminders in fallback, we don't add "no reminders due" to an error message.
             if user_data_modified_by_reminders:
                 save_memory(user_id, user_data)
-        except Exception as re: # Reminder Exception
+        except Exception as re: 
             logger.error(f"Error during fallback reminder check for user {user_id}: {re}", exc_info=True)
-            final_response_str += "\nAdditionally, could not check reminders."
+            final_response_str += "\nAdditionally, could not check reminders due to an internal issue."
         return final_response_str
 
 
