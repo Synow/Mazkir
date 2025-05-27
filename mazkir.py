@@ -70,9 +70,9 @@ class ToolExecutionError(Exception):
 def _get_default_user_data():
     """Returns the default data structure for a new user."""
     return {
-        "tasks": [],
+        "tasks": [],  # Tasks will be dictionaries, new fields will be added by add_task or load_memory migration
         "next_task_id": 1,
-        "preferences": {"tone": "neutral"}
+        "preferences": {"tone": "neutral", "daily_reminder_time": "09:00"}
     }
 
 def load_memory(user_id: str, filepath=None):
@@ -95,7 +95,18 @@ def load_memory(user_id: str, filepath=None):
                 user_data["next_task_id"] = 1
             if not isinstance(user_data.get("preferences"), dict):
                 logger.warning(f"'preferences' key missing or not a dict for user '{user_id}'. Initializing with default.")
-                user_data["preferences"] = {"tone": "neutral"}
+                user_data["preferences"] = _get_default_user_data()["preferences"] # Use default for consistency
+            else:
+                # Ensure new preference keys are present
+                user_data["preferences"].setdefault("tone", "neutral") # Ensure existing key has a default
+                user_data["preferences"].setdefault("daily_reminder_time", "09:00") # Add new key with default
+
+            # Ensure new task keys are present in existing tasks
+            for task in user_data.get("tasks", []):
+                task.setdefault("reminder_at", "")
+                task.setdefault("reminder_interval", "")
+                task.setdefault("last_reminded_at", "")
+            
             return user_data
         else:
             logger.warning(f"User '{user_id}' not found in {file_to_load}. Returning default new user structure.")
@@ -106,7 +117,8 @@ def load_memory(user_id: str, filepath=None):
         return _get_default_user_data()
     except json.JSONDecodeError as e:
         logger.error(f"Error decoding JSON from {file_to_load}: {e}. Returning default new user structure for user '{user_id}'.")
-        return _get_default_user_data() # Or raise MemoryOperationError
+        # When returning default, it will already include new preference keys from _get_default_user_data()
+        return _get_default_user_data() 
     except Exception as e:
         logger.error(f"Unexpected error loading memory for user '{user_id}' from {file_to_load}: {e}", exc_info=True)
         raise MemoryOperationError(f"Failed to load memory for user '{user_id}' due to unexpected error: {e}")
@@ -166,9 +178,12 @@ def add_task(user_data, params=None, user_id_for_save=None): # Add user_id_for_s
         "id": task_id,
         "description": params["description"],
         "status": "pending",
-        "created_at": datetime.now().isoformat()
+        "created_at": datetime.now().isoformat(),
+        "reminder_at": params.get("reminder_at", ""),
+        "reminder_interval": params.get("reminder_interval", ""),
+        "last_reminded_at": ""
     }
-    if "due_date" in params:
+    if "due_date" in params and params["due_date"]: # Ensure due_date is not empty if provided
         new_task["due_date"] = params["due_date"]
         
     user_data["tasks"].append(new_task)
@@ -291,6 +306,14 @@ def process_user_input(user_id: str, user_input_text: str, message_history: list
                         "due_date": {
                             "type": "string",
                             "description": "The due date of the task (e.g., YYYY-MM-DD). Optional."
+                        },
+                        "reminder_at": {
+                            "type": "string",
+                            "description": "The specific time for a one-time reminder in ISO 8601 format (e.g., YYYY-MM-DDTHH:MM:SS). Optional."
+                        },
+                        "reminder_interval": {
+                            "type": "string",
+                            "description": "The interval for recurring reminders (e.g., 'daily', 'weekly', 'every 2 hours'). Optional."
                         }
                     },
                     "required": ["description"]
@@ -332,7 +355,7 @@ def process_user_input(user_id: str, user_input_text: str, message_history: list
     prompt = f"""{history_prompt_segment}Current user input: "{user_input_text}"
 
 
-Based on the user input, decide if a tool should be used to manage tasks.
+Based on the user input, decide if a tool should be used to manage tasks (which can include descriptions, due dates, and reminders).
 If a tool is appropriate, use it by calling the function. Otherwise, respond in natural language.
 
 Current tasks (first 3 for context only, do not modify directly):
@@ -507,17 +530,42 @@ if __name__ == "__main__":
     # from mazkir_handlers.telegram_handler import TelegramHandler
     
     from telegram_handler import TelegramHandler 
+    from scheduler import Scheduler # Import the Scheduler
     # process_user_input is already defined in this file (mazkir.py)
     
+    mazkir_scheduler = None # Initialize scheduler variable
+    telegram_handler_instance = None # Initialize handler variable
+
     try:
         # process_user_input is a function defined in this (mazkir.py) file.
         # TELEGRAM_BOT_TOKEN will be read from environment by the handler itself.
         telegram_handler_instance = TelegramHandler(process_user_input_func=process_user_input)
-        telegram_handler_instance.start()
+        
+        # Instantiate and start the Scheduler
+        # The message_sender is the telegram_handler_instance itself, which has the async send_message method.
+        # bot_token is not needed by Scheduler if message_sender handles it.
+        mazkir_scheduler = Scheduler(message_sender=telegram_handler_instance)
+        logger.info("Starting Mazkir Scheduler...")
+        mazkir_scheduler.start()
+        
+        logger.info("Starting Telegram Handler polling...")
+        telegram_handler_instance.start() # This will block until KeyboardInterrupt or stop
+        
     except ValueError as e: # Catch errors from TelegramHandler init (e.g., missing token)
-        logger.critical(f"Could not start TelegramHandler: {e}")
+        logger.critical(f"Could not start TelegramHandler or Scheduler: {e}")
+    except KeyboardInterrupt:
+        logger.info("Mazkir application shutting down due to KeyboardInterrupt...")
     except Exception as e:
-        logger.critical(f"An unexpected error occurred when trying to start TelegramHandler: {e}", exc_info=True)
+        logger.critical(f"An unexpected error occurred in Mazkir main execution: {e}", exc_info=True)
+    finally:
+        if mazkir_scheduler:
+            logger.info("Stopping Mazkir Scheduler...")
+            mazkir_scheduler.stop()
+        
+        # Note: telegram_handler_instance.stop() might not be explicitly needed here if run_polling()
+        # handles its own cleanup on KeyboardInterrupt. If it has a specific stop method, call it.
+        # For python-telegram-bot, run_polling already stops on SIGINT (KeyboardInterrupt).
+        logger.info("Mazkir application stopped.")
 
     # To run CLI mode, you would do something like:
     # from cli_handler import CliHandler
