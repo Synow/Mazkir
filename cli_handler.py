@@ -63,6 +63,18 @@ class CliHandler(BaseHandler):
             # This case should ideally not happen if user_id is correctly managed.
             logger.warning(f"CliHandler received send_message for unexpected user_id: {user_id}")
 
+    def send_proactive_message(self, user_id: str, message: str) -> bool:
+        """
+        Sends a proactive message to the CLI user (prints to console).
+        Matches the abstract method, but print is synchronous.
+        """
+        if user_id == self.cli_user_id:
+            print(f"\n[PROACTIVE MESSAGE for User {user_id} at {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}]: {message}")
+            print(f"You: ", end="") # Print the prompt again for seamless interaction
+            return True
+        logger.warning(f"CliHandler received send_proactive_message for unexpected user_id: {user_id}")
+        return False
+
     def start(self) -> None:
         """
         Starts the CLI interaction loop.

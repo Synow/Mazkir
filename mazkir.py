@@ -3,6 +3,8 @@ import os
 import litellm
 import logging
 from datetime import datetime
+import schedule
+import time
 
 from dotenv import load_dotenv
 from openinference.instrumentation.litellm import LiteLLMInstrumentor
@@ -677,35 +679,36 @@ Your user's preferred tone is: {user_data.get("preferences", {}).get("tone", "ne
 
 {history_prompt_segment}Current user input: "{user_input_text}"
 
-Key Task Management Information:
-- Tasks can have statuses: "pending", "completed", "deferred", or "discarded".
-- When a task is marked "completed" or "discarded", it is moved to an archive.
-- You can use tools to manage tasks:
-    - `add_task`: To create a new task.
-    - `update_task_status`: To change a task's status (e.g., to "completed", "pending", "deferred").
-    - `discard_task`: To directly discard a task, which also moves it to the archive.
-    - `get_tasks`: To retrieve a list of current tasks.
+**General Instructions & Tool Usage:**
 
-Reminder Capabilities:
-- You can set reminders for tasks using the `set_reminder` tool. This requires the `task_id`.
-  - Reminder Types:
-    - "specific_time": For a one-time reminder at a specific date and time (e.g., "Remind me on 2024-01-01 at 10:00 AM").
-    - "daily": For a recurring daily reminder at a specific time of day (e.g., "Remind me daily at 8 AM").
-    - "interval": For a recurring reminder at a set interval of hours (e.g., "Remind me every 3 hours for this task"). You can also specify a start date and time for interval reminders.
-  - How to ask for reminders:
-    - For "specific_time": "Set a reminder for task 123 on July 15th at 2 PM."
-    - For "daily": "Set a daily reminder for task 456 at 7:30 AM."
-    - For "interval": "Remind me every 4 hours for task 789, starting tomorrow at 9 AM." or "Remind me every 2 hours for task 101." (starts now if no start time).
-- You can view reminders using `get_reminders`. This tool can show reminders for one task (if `task_id` is given) or all active tasks.
-- IMPORTANT: I will automatically check for any due reminders each time you talk to me and will inform you if any are due. If you explicitly ask to "check reminders" or similar, I will provide the reminder information as the main response.
+Your primary goal is to assist the user with their tasks and reminders.
+- For most operations (getting tasks, updating status, setting reminders for *existing* tasks), decide if a tool is needed and call it.
+- After any tool use, or if no tool is needed for a general query, respond to the user in natural language, summarizing actions taken or providing requested information.
+- IMPORTANT: An automatic check for due reminders occurs after every interaction. These will be appended to your main response. If the user explicitly asks "check reminders," your main response should focus on this, which will then be supplemented by the automatic check.
 
-Your Goal:
-Based on the user input, decide if a tool should be used.
-- If a tool is appropriate, call the function with the correct parameters.
-- If multiple steps are needed (e.g., creating a task then setting a reminder), call the necessary tools sequentially.
-- After tool use (or if no tool is needed), respond to the user in natural language.
-- Summarize your actions clearly (e.g., "Okay, I've added task 'Buy milk' and set a reminder for tomorrow at 9 AM.").
-- If a tool call results in an error (e.g., task not found), communicate this clearly.
+**Tools Available:**
+- `get_tasks`: Retrieves a list of current tasks.
+- `add_task`: Creates a new task. Requires `description`.
+- `update_task_status`: Changes a task's status (e.g., to "completed", "pending", "deferred"). Requires `task_id` and `status`.
+- `discard_task`: Discards a task, moving it to archive. Requires `task_id`.
+- `set_reminder`: Sets a reminder for an *existing* task. Requires `task_id`, `reminder_type` ("specific_time", "daily", "interval"), and `details` (specific to type).
+- `get_reminders`: Views reminders for one task (by `task_id`) or all active tasks.
+
+**Critical Handling for New Tasks with Reminders:**
+If the user asks to add a new task AND also requests a reminder for this new task in the same message (for example: 'add task Buy Groceries and remind me in 2 hours' or 'remind me to call Sarah tomorrow at 10 AM'):
+
+1.  Your ONLY tool call in this initial turn MUST be to `add_task`.
+2.  The `description` parameter for the `add_task` tool MUST contain only the core task description (e.g., "Buy Groceries" or "call Sarah"). It MUST NOT include any part of the reminder request (e.g., do not include 'in 2 hours' or 'tomorrow at 10 AM' in the task description).
+3.  You MUST NOT use the `set_reminder` tool in this initial turn.
+4.  After the `add_task` tool is executed by the system, your direct textual response to the user is MANDATORY and MUST follow this exact format:
+    `OK, I've added task "[task_description]" (ID: [new_task_id]). Would you like me to set a reminder for it [original_reminder_phrase]?`
+    You MUST replace `[task_description]` with the actual task description you extracted, `[new_task_id]` with the ID of the task that was just created (this will be available from the `add_task` tool's result), and `[original_reminder_phrase]` with the exact reminder phrase the user provided (e.g., 'in 2 hours' or 'tomorrow at 10 AM').
+5.  Do NOT add any other conversational text before or after this mandatory response format.
+6.  If the user then responds positively (e.g., 'yes', 'sure'), you will then use the `set_reminder` tool in the subsequent turn, using the `task_id` you mentioned in your question.
+
+If the user's request is ONLY to set a reminder for an *already existing task*, you can use `set_reminder` directly, provided they give you the task ID. If they don't provide the task ID for an existing task, ask them for it.
+
+Summarize your actions clearly. If a tool call results in an error (e.g., task not found), communicate this clearly.
 
 Current state of some tasks (for context only, use `get_tasks` for full list if needed):
 {tasks_snippet_for_prompt}
@@ -764,75 +767,137 @@ Respond now.
             
             # Pass them back to the LLM for a summary
             
-            # Construct messages for the second LLM call
-            # user_input is the original text from the user.
-            # 'message' is response.choices[0].message from the first LLM call.
-            # It needs to be converted to a dictionary to be JSON serializable.
+            # --- Start: Logic for overriding LLM response for add_task + reminder ---
+            final_response_str = None # Will be set by override or summarization
+            add_task_reminder_override = False
+            reminder_keywords = ["remind me", "reminder", " at ", " on ", " in ", " daily", " every ", " minute", " hour", " o'clock", " tomorrow", " next week"] # Case-insensitive search
 
-            assistant_message_dict = {"role": message.role} 
-            assistant_message_dict["content"] = message.content 
-            if message.tool_calls:
-                assistant_message_dict["tool_calls"] = [
-                    {
-                        "id": tc.id,
-                        "type": tc.type, 
-                        "function": {
-                            "name": tc.function.name,
-                            "arguments": tc.function.arguments 
-                        }
-                    } for tc in message.tool_calls
+            for i, tool_call in enumerate(tool_calls):
+                if tool_call.function.name == "add_task":
+                    tool_result = results[i] # Corresponding result for this add_task call
+                    if isinstance(tool_result, dict) and "error" not in tool_result: # Check if add_task was successful
+                        # Check for reminder keywords in original user input
+                        if any(keyword in user_input_text.lower() for keyword in reminder_keywords):
+                            task_id = tool_result.get("id")
+                            # Get description from function_args of the add_task call, not from user_input_text directly
+                            # to match what was actually added.
+                            original_add_task_args = json.loads(tool_call.function.arguments)
+                            task_description = original_add_task_args.get("description", "Unknown task")
+                            
+                            # Attempt to extract original reminder phrase (simple version)
+                            original_reminder_phrase = "as you requested" # Default placeholder
+                            # This is a very basic extraction. More sophisticated parsing might be needed.
+                            # It assumes the reminder part follows the task description.
+                            try:
+                                # Find the part of the input that is NOT the task description.
+                                # This is tricky because the LLM might have rephrased the task description for the add_task call.
+                                # For robustness, using a simpler placeholder or relying on the user to re-state is safer.
+                                # A more direct approach is to just use a generic phrase.
+                                # Example: "remind me to Buy Groceries in 2 hours"
+                                # Task desc: "Buy Groceries"
+                                # Reminder phrase: "in 2 hours"
+                                # We'll use a generic phrase as per instructions for simplicity if extraction is complex.
+                                # The prompt already tells the LLM to use the "original_reminder_phrase" from the user's message.
+                                # Here, we'll just use a placeholder. The LLM is *asked* to fill it in.
+                                # The prompt is: `OK, I've added task "[task_description]" (ID: [new_task_id]). Would you like me to set a reminder for it [original_reminder_phrase]?`
+                                # So, the Python code doesn't strictly need to extract it, but providing *something* is good.
+                                # Let's try a slightly better placeholder based on the input.
+                                # This is still very naive:
+                                lower_input = user_input_text.lower()
+                                for keyword in ["remind me to ", "reminder to ", "remind me ", "reminder "]: # Common prefixes
+                                    if keyword in lower_input:
+                                        split_phrase = lower_input.split(keyword, 1)
+                                        if len(split_phrase) > 1:
+                                            potential_phrase = split_phrase[1]
+                                            # Remove the task description part if it's clearly there
+                                            if task_description.lower() in potential_phrase:
+                                                original_reminder_phrase = potential_phrase.split(task_description.lower(), 1)[-1].strip()
+                                                if not original_reminder_phrase: # If only task description was after "remind me to"
+                                                    original_reminder_phrase = user_input_text # Fallback to full input
+                                            else:
+                                                original_reminder_phrase = potential_phrase # Could be "call John tomorrow at 10"
+                                            break 
+                                if original_reminder_phrase == "as you requested" or not original_reminder_phrase.strip(): # If still default or empty
+                                    # Fallback if keyword splitting didn't yield a good phrase
+                                    if task_description.lower() in lower_input:
+                                        phrase_parts = lower_input.split(task_description.lower())
+                                        if len(phrase_parts) > 1 and phrase_parts[-1].strip():
+                                            original_reminder_phrase = phrase_parts[-1].strip()
+                                        else: # If desc is at the end or no clear phrase
+                                            original_reminder_phrase = "as you specified in your message"
+                                    else: # If even the task_description isn't clearly in the input (LLM might have inferred it)
+                                        original_reminder_phrase = "as you specified"
+
+
+                            forced_response = f"OK, I've added task \"{task_description}\" (ID: {task_id}). Would you like me to set a reminder for it {original_reminder_phrase}?"
+                            final_response_str = forced_response
+                            add_task_reminder_override = True
+                            logger.info(f"Overriding LLM response for add_task with reminder prompt: {final_response_str}")
+                            break # Assuming add_task is the primary focus, stop checking other tool calls for this override
+            
+            if not add_task_reminder_override:
+                # Construct messages for the second LLM call for summarization
+                assistant_message_dict = {"role": message.role} 
+                assistant_message_dict["content"] = message.content 
+                if message.tool_calls: # Should always be true if we are in this block
+                    assistant_message_dict["tool_calls"] = [
+                        {
+                            "id": tc.id,
+                            "type": tc.type, 
+                            "function": {
+                                "name": tc.function.name,
+                                "arguments": tc.function.arguments 
+                            }
+                        } for tc in tool_calls # Use 'tool_calls' from the current scope
+                    ]
+                
+                messages_for_summary_llm = [
+                    {"role": "user", "content": user_input_text}, 
+                    assistant_message_dict 
                 ]
-            
-            messages_for_summary_llm = [
-                {"role": "user", "content": user_input_text}, 
-                assistant_message_dict 
-            ]
 
-            for i, tool_call_obj in enumerate(tool_calls): 
-                tool_result_content = json.dumps(results[i])
-                # Optional: Truncate long tool_result_content if it's from get_tasks and very long. Skipped for now.
-                messages_for_summary_llm.append({
-                    "role": "tool",
-                    "tool_call_id": tool_call_obj.id, 
-                    "name": tool_call_obj.function.name,
-                    "content": tool_result_content
-                })
-            
-            # Enhanced Logging: Log messages for summarization call
-            logger.debug(f"Messages for summarization LLM: {json.dumps(messages_for_summary_llm, indent=2)}")
+                for i, tool_call_obj in enumerate(tool_calls): # Use 'tool_calls' again
+                    tool_result_content = json.dumps(results[i])
+                    messages_for_summary_llm.append({
+                        "role": "tool",
+                        "tool_call_id": tool_call_obj.id, 
+                        "name": tool_call_obj.function.name,
+                        "content": tool_result_content
+                    })
+                
+                logger.debug(f"Messages for summarization LLM: {json.dumps(messages_for_summary_llm, indent=2)}")
 
-            try:
-                final_response_obj = litellm.completion(
-                    model=MAZKIR_LLM_MODEL,
-                    messages=messages_for_summary_llm
-                )
+                try:
+                    final_response_obj = litellm.completion(
+                        model=MAZKIR_LLM_MODEL,
+                        messages=messages_for_summary_llm
+                    )
 
-                if final_response_obj.choices and final_response_obj.choices[0].message and final_response_obj.choices[0].message.content:
-                    final_llm_output = final_response_obj.choices[0].message.content.strip()
-                    logger.info(f"LLM summary response after tool execution: '{final_llm_output}'")
-                    # Enhanced Logging: Log finish_reason
-                    logger.info(f"LLM summary finish reason: {final_response_obj.choices[0].get('finish_reason', 'N/A')}")
-                else:
-                    # Enhanced Logging: Log more details on failure
-                    finish_reason = "N/A"
-                    if final_response_obj.choices and final_response_obj.choices[0]: # Check if choices[0] exists
-                        finish_reason = final_response_obj.choices[0].get('finish_reason', 'N/A')
-                    logger.error(f"LLM response after tool execution was empty or malformed. Finish reason: {finish_reason}. Raw response object: {final_response_obj!r}") # Use !r for more detailed object logging
-                    
-                    if len(results) == 1:
-                        final_llm_output = f"Action performed. Result: {json.dumps(results[0])} (LLM summary failed)"
+                    if final_response_obj.choices and final_response_obj.choices[0].message and final_response_obj.choices[0].message.content:
+                        final_llm_output = final_response_obj.choices[0].message.content.strip()
+                        logger.info(f"LLM summary response after tool execution: '{final_llm_output}'")
+                        logger.info(f"LLM summary finish reason: {final_response_obj.choices[0].get('finish_reason', 'N/A')}")
                     else:
-                        final_llm_output = f"Actions performed. Results: {json.dumps(results)} (LLM summary failed)"
-                final_response_str = final_llm_output # Initialize final_response_str with the LLM's output (or fallback message)
-            except litellm.exceptions.APIError as e:
-                logger.error(f"LiteLLM APIError on second call (summarization): {e}", exc_info=True)
-                final_response_str = f"Error: LLM API issue after tool execution: {e}. Raw results: {json.dumps(results)}"
-            except Exception as e:
-                logger.error(f"Unexpected error during second LLM call (summarization): {e}", exc_info=True)
-                if len(results) == 1:
-                    final_response_str = f"Action performed. Result: {json.dumps(results[0])}. Error during summarization: {e}"
-                else:
-                    final_response_str = f"Actions performed. Results: {json.dumps(results)}. Error during summarization: {e}"
+                        finish_reason = "N/A"
+                        if final_response_obj.choices and final_response_obj.choices[0]:
+                            finish_reason = final_response_obj.choices[0].get('finish_reason', 'N/A')
+                        logger.error(f"LLM response after tool execution was empty or malformed. Finish reason: {finish_reason}. Raw response object: {final_response_obj!r}")
+                        
+                        if len(results) == 1:
+                            final_llm_output = f"Action performed. Result: {json.dumps(results[0])} (LLM summary failed)"
+                        else:
+                            final_llm_output = f"Actions performed. Results: {json.dumps(results)} (LLM summary failed)"
+                    final_response_str = final_llm_output
+                except litellm.exceptions.APIError as e:
+                    logger.error(f"LiteLLM APIError on second call (summarization): {e}", exc_info=True)
+                    final_response_str = f"Error: LLM API issue after tool execution: {e}. Raw results: {json.dumps(results)}"
+                except Exception as e:
+                    logger.error(f"Unexpected error during second LLM call (summarization): {e}", exc_info=True)
+                    if len(results) == 1:
+                        final_response_str = f"Action performed. Result: {json.dumps(results[0])}. Error during summarization: {e}"
+                    else:
+                        final_response_str = f"Actions performed. Results: {json.dumps(results)}. Error during summarization: {e}"
+            # --- End: Logic for overriding ---
 
         elif message.content: # Natural language response from the first LLM call
             llm_output = message.content.strip()
@@ -970,3 +1035,27 @@ if __name__ == "__main__":
     # }
     # cli_handler_instance = CliHandler(process_user_input_func=process_user_input, mazkir_instance_config=config)
     # cli_handler_instance.start()
+
+    # --- Basic Scheduling Loop (Placeholder) ---
+    # Placeholder for where scheduled jobs will be defined
+    # For example, to run a function `check_all_users_reminders` every minute:
+    # def check_all_users_reminders():
+    #     logger.info("Scheduler is checking all users for reminders...")
+    #     # This function would need to:
+    #     # 1. Read the main memory file to get a list of all user_ids.
+    #     # 2. For each user_id:
+    #     #    a. Load their user_data.
+    #     #    b. Call check_due_reminders(user_data).
+    #     #    c. If reminders are due, send them (e.g., via a pre-configured Telegram bot instance).
+    #     #    d. Save user_data if it was modified by check_due_reminders.
+    #     pass # Replace with actual reminder checking logic for all users
+
+    # schedule.every(1).minute.do(check_all_users_reminders) 
+    
+    # logger.info("Starting scheduler loop in __main__ (currently commented out)...")
+    # while True:
+    #     schedule.run_pending()
+    #     time.sleep(1)
+    # Note: The above loop is commented out as it would block TelegramHandler if run sequentially.
+    # Integration of scheduling with handlers will be addressed in a subsequent step.
+    # For now, this illustrates the basic structure.

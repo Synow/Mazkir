@@ -65,6 +65,34 @@ class TelegramHandler(BaseHandler):
             logger.error(f"Failed to send message to chat_id {chat_id} (internal user {internal_user_id}): {e}", exc_info=True)
             # Depending on the error, might try to inform the user via other means or re-raise.
 
+    async def send_proactive_message(self, user_id: str, message: str) -> bool:
+        """
+        Sends a proactive message to the specified Telegram user.
+
+        Args:
+            user_id: The internal user identifier (e.g., "telegram_123456789").
+            message: The message text to send.
+
+        Returns:
+            True if successful, False otherwise.
+        """
+        if not user_id.startswith("telegram_"):
+            logger.error(f"send_proactive_message: Invalid user_id format for Telegram: {user_id}")
+            return False
+
+        try:
+            chat_id_str = user_id.split("_", 1)[1]
+            chat_id = int(chat_id_str)
+            await self.application.bot.send_message(chat_id=chat_id, text=message)
+            logger.info(f"Proactive message sent to user_id {user_id} (chat_id {chat_id})")
+            return True
+        except ValueError:
+            logger.error(f"send_proactive_message: Could not parse chat_id from user_id: {user_id}", exc_info=True)
+            return False
+        except Exception as e:
+            logger.error(f"send_proactive_message: Failed to send message to user_id {user_id}: {e}", exc_info=True)
+            return False
+
     async def _handle_telegram_message(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         """
         Handles incoming text messages from Telegram users.

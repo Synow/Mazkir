@@ -46,3 +46,22 @@ class BaseHandler(ABC):
             A string representing the unique user identifier.
         """
         pass
+
+    @abstractmethod
+    def send_proactive_message(self, user_id: str, message: str) -> bool:
+        """
+        Sends a message to the user not as a direct reply to an incoming message.
+        This method should be implemented by concrete handlers.
+        It's expected to be callable from synchronous code that runs in a scheduler.
+        If the underlying sending mechanism is async (like in TelegramHandler),
+        the implementation will need to handle running the async code from a sync context
+        (e.g., using asyncio.run_coroutine_threadsafe if the scheduler is in a separate thread).
+
+        Args:
+            user_id: The unique identifier for the user.
+            message: The message text to send.
+
+        Returns:
+            True if the message was sent successfully (or queued successfully), False otherwise.
+        """
+        pass
